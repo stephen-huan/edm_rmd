@@ -23,7 +23,8 @@ from torch_utils import distributed as dist
 # Proposed EDM sampler (Algorithm 2).
 
 def edm_sampler(
-    net, latents, class_labels=None, randn_like=torch.randn_like,
+    net, latents, class_labels=None,
+    rand=torch.rand, randn_like=torch.randn_like,
     num_steps=18, sigma_min=0.002, sigma_max=80, rho=7,
     S_churn=0, S_min=0, S_max=float('inf'), S_noise=1,
 ):
@@ -64,7 +65,8 @@ def edm_sampler(
 # methods discussed in the paper.
 
 def ablation_sampler(
-    net, latents, class_labels=None, randn_like=torch.randn_like,
+    net, latents, class_labels=None,
+    rand=torch.rand, randn_like=torch.randn_like,
     num_steps=18, sigma_min=None, sigma_max=None, rho=7,
     solver='heun', discretization='edm', schedule='linear', scaling='none',
     epsilon_s=1e-3, C_1=0.001, C_2=0.008, M=1000, alpha=1,
@@ -177,7 +179,7 @@ def ablation_sampler(
             # From equations 7 and 8 of https://arxiv.org/pdf/2406.00924
 
             # Sample random alpha uniformly from [0,1]
-            rand_alpha = torch.rand(1, device=x_hat.device, dtype=x_hat.dtype).item()
+            rand_alpha = rand((latents.shape[0], 1, 1, 1), dtype=torch.float64, device=latents.device)
 
             # Compute the randomized midpoint time
             t_mid = t_hat + rand_alpha * h
@@ -217,6 +219,10 @@ class StackedRandomGenerator:
     def __init__(self, device, seeds):
         super().__init__()
         self.generators = [torch.Generator(device).manual_seed(int(seed) % (1 << 32)) for seed in seeds]
+
+    def rand(self, size, **kwargs):
+        assert size[0] == len(self.generators)
+        return torch.stack([torch.rand(size[1:], generator=gen, **kwargs) for gen in self.generators])
 
     def randn(self, size, **kwargs):
         assert size[0] == len(self.generators)
@@ -325,7 +331,7 @@ def main(network_pkl, outdir, subdirs, seeds, class_idx, max_batch_size, device=
         sampler_kwargs = {key: value for key, value in sampler_kwargs.items() if value is not None}
         have_ablation_kwargs = any(x in sampler_kwargs for x in ['solver', 'discretization', 'schedule', 'scaling'])
         sampler_fn = ablation_sampler if have_ablation_kwargs else edm_sampler
-        images = sampler_fn(net, latents, class_labels, randn_like=rnd.randn_like, **sampler_kwargs)
+        images = sampler_fn(net, latents, class_labels, rand=rnd.rand, randn_like=rnd.randn_like, **sampler_kwargs)
 
         # Save images.
         images_np = (images * 127.5 + 128).clip(0, 255).to(torch.uint8).permute(0, 2, 3, 1).cpu().numpy()
