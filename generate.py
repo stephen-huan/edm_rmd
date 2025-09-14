@@ -180,9 +180,10 @@ def ablation_sampler(
 
             # Sample random alpha uniformly from [0,1]
             rand_alpha = rand((latents.shape[0], 1, 1, 1), dtype=torch.float64, device=latents.device)
+            tau = -torch.log(1 + rand_alpha * (torch.exp(-h) - 1))
 
             # Compute the randomized midpoint time
-            t_mid = t_hat + rand_alpha * h
+            t_mid = t_hat + tau
 
             # Step 1: Compute the score from denoised
             # In EDM: score = (denoised - x) / sigma^2
@@ -193,8 +194,8 @@ def ablation_sampler(
 
             # Step 2: Compute midpoint using Equation 7
             # x_mid = exp(rand_alpha*h)*x_cur + (exp(rand_alpha*h)-1)*score
-            exp_alpha_h = torch.exp(rand_alpha * h)
-            x_mid = exp_alpha_h * x_hat + (exp_alpha_h - 1) * f_hat
+            exp_tau = torch.exp(tau)
+            x_mid = exp_tau * x_hat + (exp_tau - 1) * f_hat
 
             # Step 3: Compute denoised_mid and score_mid
             denoised_mid = net(x_mid / s(t_mid), sigma(t_mid), class_labels).to(torch.float64)
@@ -206,8 +207,8 @@ def ablation_sampler(
             # Step 4: Compute x_next using Equation 8
             # x_next = exp(h)*x_cur + h*exp(h*(1-rand_alpha))*score_mid
             exp_h = torch.exp(h)
-            exp_comp = torch.exp(h * (1 - rand_alpha))
-            x_next = exp_h * x_hat + h * exp_comp * f_mid
+            # exp_comp = torch.exp(h * (1 - rand_alpha))
+            x_next = exp_h * x_hat + (exp_h - 1) * f_mid
 
     return x_next
 
