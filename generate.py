@@ -70,7 +70,7 @@ def ablation_sampler(
     epsilon_s=1e-3, C_1=0.001, C_2=0.008, M=1000, alpha=1,
     S_churn=0, S_min=0, S_max=float('inf'), S_noise=1,
 ):
-    assert solver in ['euler', 'heun']
+    assert solver in ['euler', 'heun', 'midpoint']
     assert discretization in ['vp', 've', 'iddpm', 'edm']
     assert schedule in ['vp', 've', 'linear']
     assert scaling in ['vp', 'none']
@@ -164,14 +164,46 @@ def ablation_sampler(
         x_prime = x_hat + alpha * h * d_cur
         t_prime = t_hat + alpha * h
 
-        # Apply 2nd order correction.
+        # Apply 2nd order correction or randomized midpoint.
         if solver == 'euler' or i == num_steps - 1:
             x_next = x_hat + h * d_cur
-        else:
-            assert solver == 'heun'
+        elif solver == 'heun':
             denoised = net(x_prime / s(t_prime), sigma(t_prime), class_labels).to(torch.float64)
             d_prime = (sigma_deriv(t_prime) / sigma(t_prime) + s_deriv(t_prime) / s(t_prime)) * x_prime - sigma_deriv(t_prime) * s(t_prime) / sigma(t_prime) * denoised
             x_next = x_hat + h * ((1 - 1 / (2 * alpha)) * d_cur + 1 / (2 * alpha) * d_prime)
+        else:
+            assert solver == 'midpoint'
+            # Full Shen-Lee randomized midpoint method with exponential weighting
+            # From equations 7 and 8 of https://arxiv.org/pdf/2406.00924
+
+            # Sample random alpha uniformly from [0,1]
+            rand_alpha = torch.rand(1, device=x_hat.device, dtype=x_hat.dtype).item()
+
+            # Compute the randomized midpoint time
+            t_mid = t_hat + rand_alpha * h
+
+            # Step 1: Compute the score from denoised
+            # In EDM: score = (denoised - x) / sigma^2
+            score_hat = (denoised - x_hat / s(t_hat)) / (sigma(t_hat) ** 2)
+            g_hat = s_deriv(t_hat) / s(t_hat) * x_hat + s(t_hat) ** 2 * sigma_deriv(t_hat) * sigma(t_hat) * score_hat
+            f_hat = g_hat - x_hat
+
+            # Step 2: Compute midpoint using Equation 7
+            # x_mid = exp(rand_alpha*h)*x_cur + (exp(rand_alpha*h)-1)*score
+            exp_alpha_h = torch.exp(rand_alpha * h)
+            x_mid = exp_alpha_h * x_hat + (exp_alpha_h - 1) * f_hat
+
+            # Step 3: Compute denoised_mid and score_mid
+            denoised_mid = net(x_mid / s(t_mid), sigma(t_mid), class_labels).to(torch.float64)
+            score_mid = (denoised_mid - x_mid / s(t_mid)) / (sigma(t_mid) ** 2)
+            g_mid = s_deriv(t_mid) / s(t_mid) * x_mid + s(t_mid) ** 2 * sigma_deriv(t_mid) * sigma(t_mid) * score_mid
+            f_mid = g_mid - x_mid
+
+            # Step 4: Compute x_next using Equation 8
+            # x_next = exp(h)*x_cur + h*exp(h*(1-rand_alpha))*score_mid
+            exp_h = torch.exp(h)
+            exp_comp = torch.exp(h * (1 - rand_alpha))
+            x_next = exp_h * x_hat + h * exp_comp * f_mid
 
     return x_next
 
@@ -230,7 +262,7 @@ def parse_int_list(s):
 @click.option('--S_max', 'S_max',          help='Stoch. max noise level', metavar='FLOAT',                          type=click.FloatRange(min=0), default='inf', show_default=True)
 @click.option('--S_noise', 'S_noise',      help='Stoch. noise inflation', metavar='FLOAT',                          type=float, default=1, show_default=True)
 
-@click.option('--solver',                  help='Ablate ODE solver', metavar='euler|heun',                          type=click.Choice(['euler', 'heun']))
+@click.option('--solver',                  help='Ablate ODE solver', metavar='euler|heun|midpoint',                 type=click.Choice(['euler', 'heun', 'midpoint']))
 @click.option('--disc', 'discretization',  help='Ablate time step discretization {t_i}', metavar='vp|ve|iddpm|edm', type=click.Choice(['vp', 've', 'iddpm', 'edm']))
 @click.option('--schedule',                help='Ablate noise schedule sigma(t)', metavar='vp|ve|linear',           type=click.Choice(['vp', 've', 'linear']))
 @click.option('--scaling',                 help='Ablate signal scaling s(t)', metavar='vp|none',                    type=click.Choice(['vp', 'none']))
