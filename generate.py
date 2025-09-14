@@ -340,9 +340,9 @@ def main(network_pkl, outdir, subdirs, seeds, class_idx, max_batch_size, device=
             os.makedirs(image_dir, exist_ok=True)
             image_path = os.path.join(image_dir, f'{seed:06d}.png')
             if image_np.shape[2] == 1:
-                PIL.Image.fromarray(image_np[:, :, 0], 'L').save(image_path)
+                PIL.Image.fromarray(image_np[:, :, 0]).save(image_path)
             else:
-                PIL.Image.fromarray(image_np, 'RGB').save(image_path)
+                PIL.Image.fromarray(image_np).save(image_path)
 
     # Done.
     torch.distributed.barrier()

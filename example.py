@@ -74,7 +74,7 @@ def generate_image_grid(
     image = image.reshape(gridh, gridw, *image.shape[1:]).permute(0, 3, 1, 4, 2)
     image = image.reshape(gridh * net.img_resolution, gridw * net.img_resolution, net.img_channels)
     image = image.cpu().numpy()
-    PIL.Image.fromarray(image, 'RGB').save(dest_path)
+    PIL.Image.fromarray(image).save(dest_path)
     print('Done.')
 
 #----------------------------------------------------------------------------
