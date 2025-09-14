@@ -184,8 +184,9 @@ def ablation_sampler(
 
             # Step 1: Compute the score from denoised
             # In EDM: score = (denoised - x) / sigma^2
-            score_hat = (denoised - x_hat / s(t_hat)) / (sigma(t_hat) ** 2)
-            g_hat = s_deriv(t_hat) / s(t_hat) * x_hat + s(t_hat) ** 2 * sigma_deriv(t_hat) * sigma(t_hat) * score_hat
+            # score_hat = (denoised - x_hat / s(t_hat)) / (sigma(t_hat) ** 2)
+            # g_hat = s_deriv(t_hat) / s(t_hat) * x_hat + s(t_hat) ** 2 * sigma_deriv(t_hat) * sigma(t_hat) * score_hat
+            g_hat = (sigma_deriv(t_hat) / sigma(t_hat) + s_deriv(t_hat) / s(t_hat)) * x_hat - sigma_deriv(t_hat) * s(t_hat) / sigma(t_hat) * denoised
             f_hat = g_hat - x_hat
 
             # Step 2: Compute midpoint using Equation 7
@@ -195,8 +196,9 @@ def ablation_sampler(
 
             # Step 3: Compute denoised_mid and score_mid
             denoised_mid = net(x_mid / s(t_mid), sigma(t_mid), class_labels).to(torch.float64)
-            score_mid = (denoised_mid - x_mid / s(t_mid)) / (sigma(t_mid) ** 2)
-            g_mid = s_deriv(t_mid) / s(t_mid) * x_mid + s(t_mid) ** 2 * sigma_deriv(t_mid) * sigma(t_mid) * score_mid
+            # score_mid = (denoised_mid - x_mid / s(t_mid)) / (sigma(t_mid) ** 2)
+            # g_mid = s_deriv(t_mid) / s(t_mid) * x_mid + s(t_mid) ** 2 * sigma_deriv(t_mid) * sigma(t_mid) * score_mid
+            g_mid = (sigma_deriv(t_mid) / sigma(t_mid) + s_deriv(t_mid) / s(t_mid)) * x_mid - sigma_deriv(t_mid) * s(t_mid) / sigma(t_mid) * denoised_mid
             f_mid = g_mid - x_mid
 
             # Step 4: Compute x_next using Equation 8
