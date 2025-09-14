@@ -1,2 +1,7 @@
+result
+.direnv/
+.envrc
+__pycache__/
+.venv/
 out*/
 CLAUDE.md
