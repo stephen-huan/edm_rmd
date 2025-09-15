@@ -71,6 +71,7 @@ def ablation_sampler(
     solver='heun', discretization='edm', schedule='linear', scaling='none',
     epsilon_s=1e-3, C_1=0.001, C_2=0.008, M=1000, alpha=1,
     S_churn=0, S_min=0, S_max=float('inf'), S_noise=1,
+    importance_sample=True,
 ):
     assert solver in ['euler', 'heun', 'midpoint']
     assert discretization in ['vp', 've', 'iddpm', 'edm']
@@ -144,6 +145,42 @@ def ablation_sampler(
         s = lambda t: 1
         s_deriv = lambda t: 0
 
+    weight_x = lambda t, t_prime: int_factor(t) / int_factor(t_prime)
+    weight_f = lambda t, t_prime: (int_int_factor(t_prime) - int_int_factor(t)) / int_factor(t_prime)
+
+    if schedule == 'linear' and scaling == 'none':
+        linear_term = lambda t, x: 0
+        # scale_t(t) = sigma_deriv(t) / sigma(t) + s_deriv(t) / s(t)
+        scale_t = lambda t: 1 / t
+        # int_factor(t) = exp(int -scale_t(t) dt)
+        int_factor = lambda t: 1 / t
+        # int_int_factor(t) = int int_factor(t) dt
+        int_int_factor = lambda t: torch.log(t)
+        sample_t = lambda t, h, u: t * torch.pow(1 + h / t, u)
+        # optional, for numerical stability
+        weight_x = lambda t, t_prime: t_prime / t
+        weight_f = lambda t, t_prime: t_prime * (torch.log(t_prime) - torch.log(t))
+    else:
+        # generic implementation (exponential integrator)
+        # subtract 1 to remove the exponentially integrated x
+        linear_term = lambda t, x: (scale_t(t) - 1) * x
+        # scale is effectively 1 and we handle the mismatch in linear_term
+        scale_t = lambda t: sigma_deriv(t) / sigma(t) + s_deriv(t) / s(t)
+        int_factor = lambda t: torch.exp(-t)
+        int_int_factor = lambda t: -torch.exp(-t)
+        # numerically robust implementation of log1p(u * expm1(-h))
+        sample_t = lambda t, h, u: t - torch.logaddexp(torch.log1p(-u), torch.log(u) - h)
+
+        weight_x = lambda t, t_prime: torch.exp(t_prime - t)
+        weight_f = lambda t, t_prime: weight_x(t, t_prime) - 1
+
+    if importance_sample:
+        importance_weight = lambda t, t_mid, t_prime: weight_f(t, t_prime)
+    else:
+        # uniform sampling
+        importance_weight = lambda t, t_mid, t_prime: (t_prime - t) * weight_x(t_mid, t_prime)
+        sample_t = lambda t, h, u: t + h * u
+
     # Compute final time steps based on the corresponding noise levels.
     t_steps = sigma_inv(net.round_sigma(sigma_steps))
     t_steps = torch.cat([t_steps, torch.zeros_like(t_steps[:1])]) # t_N = 0
@@ -178,36 +215,47 @@ def ablation_sampler(
             # Full Shen-Lee randomized midpoint method with exponential weighting
             # From equations 7 and 8 of https://arxiv.org/pdf/2406.00924
 
-            # Sample random alpha uniformly from [0,1]
-            rand_alpha = rand((latents.shape[0], 1, 1, 1), dtype=torch.float64, device=latents.device)
+            # Sample random value uniformly from [0, 1]
+            u = rand((latents.shape[0], 1, 1, 1), dtype=torch.float64, device=latents.device)
 
             # Compute the randomized midpoint time
-            t_mid = t_hat + rand_alpha * h
+            t_mid = sample_t(t_hat, h, u)
 
             # Step 1: Compute the score from denoised
-            # In EDM: score = (denoised - x) / sigma^2
-            # score_hat = (denoised - x_hat / s(t_hat)) / (sigma(t_hat) ** 2)
-            # g_hat = s_deriv(t_hat) / s(t_hat) * x_hat + s(t_hat) ** 2 * sigma_deriv(t_hat) * sigma(t_hat) * score_hat
-            g_hat = (sigma_deriv(t_hat) / sigma(t_hat) + s_deriv(t_hat) / s(t_hat)) * x_hat - sigma_deriv(t_hat) * s(t_hat) / sigma(t_hat) * denoised
-            f_hat = g_hat - x_hat
+            g_hat = sigma_deriv(t_hat) * s(t_hat) / sigma(t_hat) * denoised
+            f_hat = linear_term(t_hat, x_hat) - g_hat
 
             # Step 2: Compute midpoint using Equation 7
-            # x_mid = exp(rand_alpha*h)*x_cur + (exp(rand_alpha*h)-1)*score
-            exp_alpha_h = torch.exp(rand_alpha * h)
-            x_mid = exp_alpha_h * x_hat + (exp_alpha_h - 1) * f_hat
+            exp_x_mid = weight_x(t_hat, t_mid)
+            exp_f_mid = weight_f(t_hat, t_mid)
+            x_mid = exp_x_mid * x_hat + exp_f_mid * f_hat
 
             # Step 3: Compute denoised_mid and score_mid
             denoised_mid = net(x_mid / s(t_mid), sigma(t_mid), class_labels).to(torch.float64)
-            # score_mid = (denoised_mid - x_mid / s(t_mid)) / (sigma(t_mid) ** 2)
-            # g_mid = s_deriv(t_mid) / s(t_mid) * x_mid + s(t_mid) ** 2 * sigma_deriv(t_mid) * sigma(t_mid) * score_mid
-            g_mid = (sigma_deriv(t_mid) / sigma(t_mid) + s_deriv(t_mid) / s(t_mid)) * x_mid - sigma_deriv(t_mid) * s(t_mid) / sigma(t_mid) * denoised_mid
-            f_mid = g_mid - x_mid
+            g_mid = sigma_deriv(t_mid) * s(t_mid) / sigma(t_mid) * denoised_mid
+            f_mid = linear_term(t_mid, x_mid) - g_mid
 
             # Step 4: Compute x_next using Equation 8
-            # x_next = exp(h)*x_cur + h*exp(h*(1-rand_alpha))*score_mid
-            exp_h = torch.exp(h)
-            exp_comp = torch.exp(h * (1 - rand_alpha))
-            x_next = exp_h * x_hat + h * exp_comp * f_mid
+            exp_x_next = weight_x(t_hat, t_next)
+            exp_f_next = importance_weight(t_hat, t_mid, t_next)
+            x_next = exp_x_next * x_hat + exp_f_next * f_mid
+
+            scale_t_hat = sigma_deriv(t_hat) / sigma(t_hat) + s_deriv(t_hat) / s(t_hat)
+            assert torch.allclose(scale_t(t_hat), scale_t_hat), 'scale_t wrong.'
+            tau = t_mid - t_hat
+            assert ((h <= tau) & (tau <= 0)).all(), 't_mid out of valid range.'
+            if schedule == 'linear' and scaling == 'none':
+                assert torch.allclose(exp_x_mid, 1 + tau / t_hat), 'exp_x_mid wrong.'
+                assert torch.allclose(exp_f_mid, t_mid * torch.log(exp_x_mid)), 'exp_f_mid wrong.'
+                assert torch.allclose(exp_x_next, 1 + h / t_hat), 'exp_x_next wrong.'
+                target = t_next * (torch.log(exp_x_next) if importance_sample else h / t_mid)
+                assert torch.allclose(exp_f_next, target), 'exp_f_next wrong.'
+            else:
+                assert torch.allclose(exp_x_mid, torch.exp(tau)), 'exp_x_mid wrong.'
+                assert torch.allclose(exp_f_mid, exp_x_mid - 1), 'exp_f_mid wrong.'
+                assert torch.allclose(exp_x_next, torch.exp(h)), 'exp_x_next wrong.'
+                target = (exp_x_next - 1) if importance_sample else (h * torch.exp(h - tau))
+                assert torch.allclose(exp_f_next, target), 'exp_f_next wrong.'
 
     return x_next
 
