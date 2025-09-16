@@ -163,9 +163,8 @@ def ablation_sampler(
     else:
         # generic implementation (exponential integrator)
         # subtract 1 to remove the exponentially integrated x
-        linear_term = lambda t: scale_t(t) - 1
-        # scale is effectively 1 and we handle the mismatch in linear_term
-        scale_t = lambda t: sigma_deriv(t) / sigma(t) + s_deriv(t) / s(t)
+        linear_term = lambda t: sigma_deriv(t) / sigma(t) + s_deriv(t) / s(t) - 1
+        scale_t = lambda t: 1
         int_factor = lambda t: torch.exp(-t)
         int_int_factor = lambda t: -torch.exp(-t)
         # numerically robust implementation of log1p(u * expm1(-h))
@@ -240,8 +239,8 @@ def ablation_sampler(
             exp_f_next = importance_weight(t_hat, t_mid, t_next)
             x_next = exp_x_next * x_hat + exp_f_next * f_mid
 
-            scale_t_hat = sigma_deriv(t_hat) / sigma(t_hat) + s_deriv(t_hat) / s(t_hat)
-            assert torch.allclose(scale_t(t_hat), scale_t_hat), 'scale_t wrong.'
+            d_t = (scale_t(t_hat) + linear_term(t_hat)) * x_hat - sigma_deriv(t_hat) * s(t_hat) / sigma(t_hat) * denoised
+            assert torch.allclose(d_t, d_cur), 'scale_t and linear_term wrong.'
             tau = t_mid - t_hat
             assert ((h <= tau) & (tau <= 0)).all(), 't_mid out of valid range.'
             if schedule == 'linear' and scaling == 'none':
