@@ -149,7 +149,7 @@ def ablation_sampler(
     weight_f = lambda t, t_prime: (int_int_factor(t_prime) - int_int_factor(t)) / int_factor(t_prime)
 
     if schedule == 'linear' and scaling == 'none':
-        linear_term = lambda t, x: 0
+        linear_term = lambda t: 0
         # scale_t(t) = sigma_deriv(t) / sigma(t) + s_deriv(t) / s(t)
         scale_t = lambda t: 1 / t
         # int_factor(t) = exp(int -scale_t(t) dt)
@@ -163,7 +163,7 @@ def ablation_sampler(
     else:
         # generic implementation (exponential integrator)
         # subtract 1 to remove the exponentially integrated x
-        linear_term = lambda t, x: (scale_t(t) - 1) * x
+        linear_term = lambda t: scale_t(t) - 1
         # scale is effectively 1 and we handle the mismatch in linear_term
         scale_t = lambda t: sigma_deriv(t) / sigma(t) + s_deriv(t) / s(t)
         int_factor = lambda t: torch.exp(-t)
@@ -223,7 +223,7 @@ def ablation_sampler(
 
             # Step 1: Compute the score from denoised
             g_hat = sigma_deriv(t_hat) * s(t_hat) / sigma(t_hat) * denoised
-            f_hat = linear_term(t_hat, x_hat) - g_hat
+            f_hat = linear_term(t_hat) * x_hat - g_hat
 
             # Step 2: Compute midpoint using Equation 7
             exp_x_mid = weight_x(t_hat, t_mid)
@@ -233,7 +233,7 @@ def ablation_sampler(
             # Step 3: Compute denoised_mid and score_mid
             denoised_mid = net(x_mid / s(t_mid), sigma(t_mid), class_labels).to(torch.float64)
             g_mid = sigma_deriv(t_mid) * s(t_mid) / sigma(t_mid) * denoised_mid
-            f_mid = linear_term(t_mid, x_mid) - g_mid
+            f_mid = linear_term(t_mid) * x_mid - g_mid
 
             # Step 4: Compute x_next using Equation 8
             exp_x_next = weight_x(t_hat, t_next)
