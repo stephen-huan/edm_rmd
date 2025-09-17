@@ -229,6 +229,29 @@ def ablation_sampler(
             * torch.tanh(x := (1 - u) * int_int_factor(t) + u * int_int_factor(t + h))
             * torch.cosh(x)
         )
+    elif schedule == 've' and not handle_skip:
+        assert scaling == 'none', f"scaling {scaling} not supported for {schedule} schedule."
+        assert is_edm, "non-edm preconditioning not supported."
+        linear_term = lambda t: 0
+        scale_t = lambda t: 1 / (2 * t)
+        int_factor = lambda t: 1 / torch.sqrt(t)
+        int_int_factor = lambda t: 2 * torch.sqrt(t)
+        sample_t = lambda t, h, u: torch.square(
+            (1 - u) * torch.sqrt(t) + u * torch.sqrt(t + h)
+        )
+    elif schedule == 've' and handle_skip:
+        assert scaling == 'none', f"scaling {scaling} not supported for {schedule} schedule."
+        linear_term = lambda t: c_skip(t) * sigma_deriv(t) / sigma(t)
+        scale_t = lambda t: 1 / (2 * (t + net.sigma_data**2))
+        int_factor = lambda t: 1 / torch.sqrt(t + net.sigma_data**2)
+        int_int_factor = lambda t: 2 * torch.sqrt(t + net.sigma_data**2)
+        sample_t = (
+            lambda t, h, u: torch.square(
+                (1 - u) * torch.sqrt(t + net.sigma_data**2)
+                + u * torch.sqrt(t + h + net.sigma_data**2)
+            )
+            - net.sigma_data**2
+        )
     else:
         # generic implementation (exponential integrator)
         # subtract 1 to remove the exponentially integrated x
@@ -279,7 +302,9 @@ def ablation_sampler(
             x_next = x_hat + h * ((1 - 1 / (2 * alpha)) * d_cur + 1 / (2 * alpha) * d_prime)
         else:
             assert solver == 'midpoint'
-            if i == num_steps - 1 and (schedule == 'linear' and not handle_skip):
+            if i == num_steps - 1 and (
+                (schedule == "linear" or schedule == "ve") and not handle_skip
+            ):
                 x_next = x_hat + h * d_cur
                 continue
             # Full Shen-Lee randomized midpoint method with exponential weighting
@@ -326,6 +351,10 @@ def ablation_sampler(
                 target = t_next * (torch.log(exp_x_next) if importance_sample else h / t_mid)
                 assert torch.allclose(exp_f_next, target), 'exp_f_next wrong.'
             elif schedule == 'linear' and handle_skip:
+                ...
+            elif schedule == 've' and not handle_skip:
+                ...
+            elif schedule == 've' and handle_skip:
                 ...
             else:
                 assert torch.allclose(exp_x_mid, torch.exp(tau)), 'exp_x_mid wrong.'
