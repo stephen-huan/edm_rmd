@@ -269,7 +269,7 @@ def ablation_sampler(
         t_prime = t_hat + alpha * h
 
         # Apply 2nd order correction or randomized midpoint.
-        if solver == 'euler' or i == num_steps - 1:
+        if solver == 'euler' or (i == num_steps - 1 and solver == 'heun'):
             x_next = x_hat + h * d_cur
         elif solver == 'heun':
             denoised = net(x_prime / s(t_prime), sigma(t_prime), class_labels).to(torch.float64)
@@ -277,6 +277,9 @@ def ablation_sampler(
             x_next = x_hat + h * ((1 - 1 / (2 * alpha)) * d_cur + 1 / (2 * alpha) * d_prime)
         else:
             assert solver == 'midpoint'
+            if i == num_steps - 1 and (schedule == 'linear' and scaling == 'none' and not handle_skip):
+                x_next = x_hat + h * d_cur
+                continue
             # Full Shen-Lee randomized midpoint method with exponential weighting
             # From equations 7 and 8 of https://arxiv.org/pdf/2406.00924
 
