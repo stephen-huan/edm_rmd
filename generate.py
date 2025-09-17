@@ -19,6 +19,49 @@ import PIL.Image
 import dnnlib
 from torch_utils import distributed as dist
 
+# combined forward pass from training/networks.py
+
+def model_forward(self, x, sigma, class_labels=None, force_fp32=False, no_skip=False, **model_kwargs):
+    x = x.to(torch.float32)
+    sigma = sigma.to(torch.float32).reshape(-1, 1, 1, 1)
+    class_labels = None if self.label_dim == 0 else torch.zeros([1, self.label_dim], device=x.device) if class_labels is None else class_labels.to(torch.float32).reshape(-1, self.label_dim)
+    dtype = torch.float16 if (self.use_fp16 and not force_fp32 and x.device.type == 'cuda') else torch.float32
+
+    net_name = type(next(self.modules())).__name__
+    c_skip, c_out, c_in, c_noise = {
+        "VPPrecond": lambda self: (
+            1,
+            -sigma,
+            1 / (sigma ** 2 + 1).sqrt(),
+            (self.M - 1) * self.sigma_inv(sigma),
+        ),
+        "VEPrecond": lambda self: (
+            1,
+            sigma,
+            1,
+            (0.5 * sigma).log(),
+        ),
+        "iDDPMPrecond": lambda self: (
+            1,
+            -sigma,
+            1 / (sigma ** 2 + 1).sqrt(),
+            self.M - 1 - self.round_sigma(sigma, return_index=True).to(torch.float32),
+        ),
+        "EDMPrecond": lambda self: (
+            self.sigma_data ** 2 / (sigma ** 2 + self.sigma_data ** 2),
+            sigma * self.sigma_data / (sigma ** 2 + self.sigma_data ** 2).sqrt(),
+            1 / (self.sigma_data ** 2 + sigma ** 2).sqrt(),
+            sigma.log() / 4,
+        ),
+    }[net_name](self)
+    if no_skip:
+        c_skip = 0
+
+    F_x = self.model((c_in * x).to(dtype), c_noise.flatten(), class_labels=class_labels, **model_kwargs)
+    assert F_x.dtype == dtype
+    D_x = c_skip * x + c_out * F_x.to(torch.float32)
+    return D_x
+
 #----------------------------------------------------------------------------
 # Proposed EDM sampler (Algorithm 2).
 
@@ -71,7 +114,7 @@ def ablation_sampler(
     solver='heun', discretization='edm', schedule='linear', scaling='none',
     epsilon_s=1e-3, C_1=0.001, C_2=0.008, M=1000, alpha=1,
     S_churn=0, S_min=0, S_max=float('inf'), S_noise=1,
-    importance_sample=True,
+    importance_sample=True, handle_skip=True, check_skip=False,
 ):
     assert solver in ['euler', 'heun', 'midpoint']
     assert discretization in ['vp', 've', 'iddpm', 'edm']
@@ -148,7 +191,17 @@ def ablation_sampler(
     weight_x = lambda t, t_prime: int_factor(t) / int_factor(t_prime)
     weight_f = lambda t, t_prime: (int_int_factor(t_prime) - int_int_factor(t)) / int_factor(t_prime)
 
-    if schedule == 'linear' and scaling == 'none':
+    net_name = type(next(net.modules())).__name__
+    networks = ["VPPrecond", "VEPrecond", "iDDPMPrecond", "EDMPrecond"]
+    assert net_name in networks, f"unknown network {net_name}."
+    is_edm = net_name == "EDMPrecond"
+    c_skip = (
+        (lambda t: net.sigma_data**2 / (sigma(t)**2 + net.sigma_data**2))
+        if is_edm
+        else (lambda t: 1)
+    )
+
+    if schedule == 'linear' and scaling == 'none' and not handle_skip:
         linear_term = lambda t: 0
         # scale_t(t) = sigma_deriv(t) / sigma(t) + s_deriv(t) / s(t)
         scale_t = lambda t: 1 / t
@@ -156,10 +209,24 @@ def ablation_sampler(
         int_factor = lambda t: 1 / t
         # int_int_factor(t) = int int_factor(t) dt
         int_int_factor = lambda t: torch.log(t)
+        # sample_t(t, h, u) = int_int^{-1}((1 - u) * int_int(t) + u * int_int(t + h))
         sample_t = lambda t, h, u: t * torch.pow(1 + h / t, u)
         # optional, for numerical stability
         weight_x = lambda t, t_prime: t_prime / t
         weight_f = lambda t, t_prime: t_prime * (torch.log(t_prime) - torch.log(t))
+    elif schedule == 'linear' and scaling == 'none' and handle_skip:
+        assert is_edm, "non-edm preconditioning not supported."
+        # remove internal skip connection in net
+        linear_term = lambda t: c_skip(t) * sigma_deriv(t) / sigma(t)
+        # scale_t(t) = (1 - c_skip(t)) sigma_deriv(t) / sigma(t) + s_deriv(t) / s(t)
+        scale_t = lambda t: t / (t**2 + net.sigma_data**2)
+        int_factor = lambda t: 1 / torch.sqrt(t**2 + net.sigma_data**2)
+        int_int_factor = lambda t: torch.atanh(t / torch.sqrt(t**2 + net.sigma_data**2))
+        sample_t = (
+            lambda t, h, u: net.sigma_data
+            * torch.tanh(x := (1 - u) * int_int_factor(t) + u * int_int_factor(t + h))
+            * torch.cosh(x)
+        )
     else:
         # generic implementation (exponential integrator)
         # subtract 1 to remove the exponentially integrated x
@@ -169,7 +236,6 @@ def ablation_sampler(
         int_int_factor = lambda t: -torch.exp(-t)
         # numerically robust implementation of log1p(u * expm1(-h))
         sample_t = lambda t, h, u: t - torch.logaddexp(torch.log1p(-u), torch.log(u) - h)
-
         weight_x = lambda t, t_prime: torch.exp(t_prime - t)
         weight_f = lambda t, t_prime: weight_x(t, t_prime) - 1
 
@@ -239,16 +305,23 @@ def ablation_sampler(
             exp_f_next = importance_weight(t_hat, t_mid, t_next)
             x_next = exp_x_next * x_hat + exp_f_next * f_mid
 
-            d_t = (scale_t(t_hat) + linear_term(t_hat)) * x_hat - sigma_deriv(t_hat) * s(t_hat) / sigma(t_hat) * denoised
-            assert torch.allclose(d_t, d_cur), 'scale_t and linear_term wrong.'
+            # costly model evaluations, so disabled by default
+            if check_skip:
+                skip = model_forward(net, x_hat / s(t_hat), sigma(t_hat), class_labels).to(torch.float64)
+                assert torch.allclose(skip, denoised), 'model_forward wrong.'
+                no_skip = model_forward(net, x_hat / s(t_hat), sigma(t_hat), class_labels, no_skip=True).to(torch.float64)
+                assert torch.allclose(no_skip + c_skip(t_hat) * x_hat / s(t_hat), denoised, atol=1e-6), 'c_skip wrong.'
+            assert torch.allclose(scale_t(t_hat) * x_hat + f_hat, d_cur, atol=1e-4), 'scale_t and linear_term wrong.'
             tau = t_mid - t_hat
             assert ((h <= tau) & (tau <= 0)).all(), 't_mid out of valid range.'
-            if schedule == 'linear' and scaling == 'none':
+            if schedule == 'linear' and scaling == 'none' and not handle_skip:
                 assert torch.allclose(exp_x_mid, 1 + tau / t_hat), 'exp_x_mid wrong.'
                 assert torch.allclose(exp_f_mid, t_mid * torch.log(exp_x_mid)), 'exp_f_mid wrong.'
                 assert torch.allclose(exp_x_next, 1 + h / t_hat), 'exp_x_next wrong.'
                 target = t_next * (torch.log(exp_x_next) if importance_sample else h / t_mid)
                 assert torch.allclose(exp_f_next, target), 'exp_f_next wrong.'
+            elif schedule == 'linear' and scaling == 'none' and handle_skip:
+                ...
             else:
                 assert torch.allclose(exp_x_mid, torch.exp(tau)), 'exp_x_mid wrong.'
                 assert torch.allclose(exp_f_mid, exp_x_mid - 1), 'exp_f_mid wrong.'
