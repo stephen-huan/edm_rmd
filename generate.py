@@ -201,7 +201,8 @@ def ablation_sampler(
         else (lambda t: 1)
     )
 
-    if schedule == 'linear' and scaling == 'none' and not handle_skip:
+    if schedule == 'linear' and not handle_skip:
+        assert scaling == 'none', f"scaling {scaling} not supported for {schedule} schedule."
         linear_term = lambda t: 0
         # scale_t(t) = sigma_deriv(t) / sigma(t) + s_deriv(t) / s(t)
         scale_t = lambda t: 1 / t
@@ -214,7 +215,8 @@ def ablation_sampler(
         # optional, for numerical stability
         weight_x = lambda t, t_prime: t_prime / t
         weight_f = lambda t, t_prime: t_prime * (torch.log(t_prime) - torch.log(t))
-    elif schedule == 'linear' and scaling == 'none' and handle_skip:
+    elif schedule == 'linear' and handle_skip:
+        assert scaling == 'none', f"scaling {scaling} not supported for {schedule} schedule."
         assert is_edm, "non-edm preconditioning not supported."
         # remove internal skip connection in net
         linear_term = lambda t: c_skip(t) * sigma_deriv(t) / sigma(t)
@@ -277,7 +279,7 @@ def ablation_sampler(
             x_next = x_hat + h * ((1 - 1 / (2 * alpha)) * d_cur + 1 / (2 * alpha) * d_prime)
         else:
             assert solver == 'midpoint'
-            if i == num_steps - 1 and (schedule == 'linear' and scaling == 'none' and not handle_skip):
+            if i == num_steps - 1 and (schedule == 'linear' and not handle_skip):
                 x_next = x_hat + h * d_cur
                 continue
             # Full Shen-Lee randomized midpoint method with exponential weighting
@@ -317,13 +319,13 @@ def ablation_sampler(
             assert torch.allclose(scale_t(t_hat) * x_hat + f_hat, d_cur, atol=1e-4), 'scale_t and linear_term wrong.'
             tau = t_mid - t_hat
             assert ((h <= tau) & (tau <= 0)).all(), 't_mid out of valid range.'
-            if schedule == 'linear' and scaling == 'none' and not handle_skip:
+            if schedule == 'linear' and not handle_skip:
                 assert torch.allclose(exp_x_mid, 1 + tau / t_hat), 'exp_x_mid wrong.'
                 assert torch.allclose(exp_f_mid, t_mid * torch.log(exp_x_mid)), 'exp_f_mid wrong.'
                 assert torch.allclose(exp_x_next, 1 + h / t_hat), 'exp_x_next wrong.'
                 target = t_next * (torch.log(exp_x_next) if importance_sample else h / t_mid)
                 assert torch.allclose(exp_f_next, target), 'exp_f_next wrong.'
-            elif schedule == 'linear' and scaling == 'none' and handle_skip:
+            elif schedule == 'linear' and handle_skip:
                 ...
             else:
                 assert torch.allclose(exp_x_mid, torch.exp(tau)), 'exp_x_mid wrong.'
