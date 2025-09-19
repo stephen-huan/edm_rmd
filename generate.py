@@ -14,6 +14,9 @@ import click
 import tqdm
 import pickle
 import numpy as np
+from scipy.integrate import quad
+from scipy.optimize import root_scalar
+from scipy.special import dawsn
 import torch
 import PIL.Image
 import dnnlib
@@ -61,6 +64,55 @@ def model_forward(self, x, sigma, class_labels=None, force_fp32=False, no_skip=F
     assert F_x.dtype == dtype
     D_x = c_skip * x + c_out * F_x.to(torch.float32)
     return D_x
+
+
+def quadrature(f):
+    """Definite integral of f."""
+
+    def integrate(f, t, t_prime):
+        """Integral of f from t to t_prime."""
+        return quad(f, t, t_prime)[0]
+
+    def F(t, t_prime):
+        t = t.item() if isinstance(t, torch.Tensor) else t
+        if isinstance(t_prime, float) or t_prime.ndim == 0:
+            t_prime = t_prime.item() if isinstance(t_prime, torch.Tensor) else t_prime
+            return integrate(f, t, t_prime)
+        else:
+            t_primep = t_prime.cpu().numpy().flatten()
+            # nasty broadcasting bug
+            return torch.tensor(
+                [integrate(f, t, s) for s in t_primep],
+                dtype=torch.float64,
+                device=t_prime.device,
+            ).reshape(t_prime.shape)
+
+    return F
+
+
+def inverse_sample(int_int_factor):
+    """Sample from the density proportional to int_factor in [t, t + h]."""
+
+    def inverse(t, h, y):
+        """Return x such that int_int_factor(t, x) = y."""
+        return root_scalar(
+            lambda x: int_int_factor(t, x) - y,
+            bracket=[t, t + h],
+            method="brentq",
+        ).root
+
+    def sample(t, h, u):
+        tp = t.cpu().numpy()
+        hp = h.cpu().numpy()
+        up = u.cpu().numpy()
+        return torch.tensor(
+            [inverse(tp, hp, u * int_int_factor(tp, tp + hp)) for u in up],
+            dtype=torch.float64,
+            device=u.device,
+        ).reshape(u.shape)
+
+    return sample
+
 
 #----------------------------------------------------------------------------
 # Proposed EDM sampler (Algorithm 2).
@@ -252,6 +304,43 @@ def ablation_sampler(
             )
             - net.sigma_data**2
         )
+    elif schedule == 'vp' and not handle_skip:
+        raise ValueError(f"cannot ignore skip connection for {schedule} schedule.")
+    elif schedule == 'vp' and handle_skip and is_edm:
+        assert scaling == 'vp', f"scaling {scaling} not supported for {schedule} schedule."
+        linear_term = lambda t: c_skip(t) * sigma_deriv(t) / sigma(t)
+        scale_t = (
+            lambda t: (1 - net.sigma_data**2)
+            * (vp_beta_d * t + vp_beta_min)
+            / (2 * (sigma(t) ** 2 + net.sigma_data**2))
+        )
+        int_factor = lambda t: torch.sqrt(
+            (sigma(t) ** 2 + 1) / (sigma(t) ** 2 + net.sigma_data**2)
+        )
+        int_factor_np = lambda t: np.sqrt(
+            (sigma(t) ** 2 + 1) / (sigma(t) ** 2 + net.sigma_data**2)
+        )
+        int_int_diff = quadrature(int_factor_np)
+        sample_t = inverse_sample(int_int_diff)
+        weight_f = lambda t, t_prime: int_int_diff(t, t_prime) / int_factor(t_prime)
+    elif schedule == 'vp' and handle_skip and not is_edm:
+        assert scaling == 'vp', f"scaling {scaling} not supported for {schedule} schedule."
+        linear_term = lambda t: c_skip(t) * sigma_deriv(t) / sigma(t)
+        scale_t = lambda t: -(vp_beta_d * t + vp_beta_min) / 2
+        int_factor = lambda t: torch.sqrt(1 + sigma(t) ** 2)
+        int_int_factor_np = lambda t: (
+            2
+            * np.sqrt(1 + sigma(t) ** 2)
+            * dawsn((vp_beta_d * t + vp_beta_min) / (2 * np.sqrt(vp_beta_d)))
+            / np.sqrt(vp_beta_d)
+        )
+        int_int_factor = lambda t: torch.as_tensor(
+            int_int_factor_np(t.cpu().numpy()),
+            dtype=torch.float64,
+            device=t.device,
+        )
+        int_int_diff = lambda t, t_prime: int_int_factor_np(t_prime) - int_int_factor_np(t)
+        sample_t = inverse_sample(int_int_diff)
     else:
         # generic implementation (exponential integrator)
         # subtract 1 to remove the exponentially integrated x
@@ -355,6 +444,10 @@ def ablation_sampler(
             elif schedule == 've' and not handle_skip:
                 ...
             elif schedule == 've' and handle_skip:
+                ...
+            elif schedule == 'vp' and not handle_skip:
+                ...
+            elif schedule == 'vp' and handle_skip:
                 ...
             else:
                 assert torch.allclose(exp_x_mid, torch.exp(tau)), 'exp_x_mid wrong.'
