@@ -14,14 +14,6 @@ In this repository, `generate.py` has been modified to implement the
 randomized midpoint method and `example.py` has been modified to work
 with the latest Pillow.
 
-`calculate_metrics.py` and `generate_images.py` are copied verbatim from
-[edm2](https://github.com/NVlabs/edm2) by Tero Karras, Miika Aittala,
-Jaakko Lehtinen, Janne Hellsten, Timo Aila, Samuli Laine and Tero Karras,
-Miika Aittala, Tuomas Kynkäänniemi, Jaakko Lehtinen, Timo Aila, Samuli
-Laine. The contents of that repository are also licensed under the
-[Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International
-License](http://creativecommons.org/licenses/by-nc-sa/4.0/).
-
 ### Upstream License
 
 Copyright &copy; 2022, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
