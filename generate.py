@@ -352,6 +352,7 @@ def ablation_sampler(
         sample_t = lambda t, h, u: t - torch.logaddexp(torch.log1p(-u), torch.log(u) - h)
         weight_x = lambda t, t_prime: torch.exp(t_prime - t)
         weight_f = lambda t, t_prime: weight_x(t, t_prime) - 1
+        raise ValueError(f"unsupported combination schedule {schedule} scaling {scaling}.")
 
     if importance_sample:
         importance_weight = lambda t, t_mid, t_prime: weight_f(t, t_prime)
