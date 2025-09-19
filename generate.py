@@ -248,7 +248,7 @@ def ablation_sampler(
     assert net_name in networks, f"unknown network {net_name}."
     is_edm = net_name == "EDMPrecond"
     c_skip = (
-        (lambda t: net.sigma_data**2 / (sigma(t)**2 + net.sigma_data**2))
+        (lambda t: net.sigma_data**2 / (sigma(t) ** 2 + net.sigma_data**2))
         if is_edm
         else (lambda t: 1)
     )
