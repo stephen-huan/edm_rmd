@@ -70,7 +70,7 @@ if __name__ == "__main__":
             network=args.network,
             outdir=outdir,
             seeds=seeds,
-            steps=steps,
+            steps=int(steps),
             solver=solver,
             disc=args.disc,
             schedule=args.schedule,
