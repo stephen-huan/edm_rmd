@@ -16,6 +16,7 @@ def generate(
     disc: str,
     schedule: str,
     scaling: str,
+    rho: float,
 ) -> None:
     subprocess.run(
         [
@@ -32,6 +33,7 @@ def generate(
             f"--schedule={schedule}",
             f"--scaling={scaling}",
             f"--network={network}",
+            f"--rho={rho}",
         ]
     )
 
@@ -47,14 +49,19 @@ if __name__ == "__main__":
     parser.add_argument("--disc", type=str)
     parser.add_argument("--schedule", type=str)
     parser.add_argument("--scaling", type=str)
+    parser.add_argument("--rho", type=str, default="7")
     args = parser.parse_args()
 
-    for seeds, steps, solver in itertools.product(
-        args.seeds.split(","), args.steps.split(","), args.solver.split(",")
+    for seeds, steps, solver, rho in itertools.product(
+        args.seeds.split(","),
+        args.steps.split(","),
+        args.solver.split(","),
+        args.rho.split(","),
     ):
         net_name = args.network.split("/")[-1]
         outdir = args.outdir / (
             f"{net_name}_{solver}_{args.disc}_{args.schedule}_{args.scaling}"
+            + f"_{rho}"
             + f"_{steps:0>4}_{seeds}"
         )
         outdir.mkdir(exist_ok=True, parents=True)
@@ -68,4 +75,5 @@ if __name__ == "__main__":
             disc=args.disc,
             schedule=args.schedule,
             scaling=args.scaling,
+            rho=float(rho),
         )
