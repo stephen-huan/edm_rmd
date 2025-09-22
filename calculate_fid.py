@@ -13,7 +13,7 @@ def compute_metrics(
     metrics: str,
     outdir: Path,
 ) -> None:
-    out = subprocess.run(
+    out = subprocess.check_output(
         [
             "torchrun",
             "--standalone",
@@ -24,14 +24,12 @@ def compute_metrics(
             f"--ref={ref}",
             f"--metrics={metrics}",
         ],
-        capture_output=True,
         text=True,
-        check=True,
     )
-    print(out.stdout)
+    print(out)
     outdir.mkdir(exist_ok=True, parents=True)
     with open(outdir / f"{images.name}.txt", "w") as f:
-        f.write(out.stdout)
+        f.write(out)
 
 
 if __name__ == "__main__":
