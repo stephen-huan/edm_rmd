@@ -170,8 +170,8 @@ def ablation_sampler(
 ):
     assert solver in ['euler', 'heun', 'midpoint']
     assert discretization in ['vp', 've', 'iddpm', 'edm']
-    assert schedule in ['vp', 've', 'linear']
-    assert scaling in ['vp', 'none']
+    assert schedule in ['ou', 'vp', 've', 'linear']
+    assert scaling in ['ou', 'vp', 'none']
 
     # Helper functions for VP & VE noise level schedules.
     vp_sigma = lambda beta_d, beta_min: lambda t: (np.e ** (0.5 * beta_d * (t ** 2) + beta_min * t) - 1) ** 0.5
@@ -217,7 +217,11 @@ def ablation_sampler(
         sigma_steps = (sigma_max ** (1 / rho) + step_indices / (num_steps - 1) * (sigma_min ** (1 / rho) - sigma_max ** (1 / rho))) ** rho
 
     # Define noise level schedule.
-    if schedule == 'vp':
+    if schedule == 'ou':
+        sigma = lambda t: torch.sqrt(torch.expm1(2 * t))
+        sigma_deriv = lambda t: sigma(t) + 1 / sigma(t)
+        sigma_inv = lambda sigma: torch.log1p(sigma**2) / 2
+    elif schedule == 'vp':
         sigma = vp_sigma(vp_beta_d, vp_beta_min)
         sigma_deriv = vp_sigma_deriv(vp_beta_d, vp_beta_min)
         sigma_inv = vp_sigma_inv(vp_beta_d, vp_beta_min)
@@ -232,7 +236,10 @@ def ablation_sampler(
         sigma_inv = lambda sigma: sigma
 
     # Define scaling schedule.
-    if scaling == 'vp':
+    if scaling == 'ou':
+        s = lambda t: torch.exp(-t)
+        s_deriv = lambda t: -s(t)
+    elif scaling == 'vp':
         s = lambda t: 1 / (1 + sigma(t) ** 2).sqrt()
         s_deriv = lambda t: -sigma(t) * sigma_deriv(t) * (s(t) ** 3)
     else:
@@ -520,8 +527,8 @@ def parse_int_list(s):
 
 @click.option('--solver',                  help='Ablate ODE solver', metavar='euler|heun|midpoint',                 type=click.Choice(['euler', 'heun', 'midpoint']))
 @click.option('--disc', 'discretization',  help='Ablate time step discretization {t_i}', metavar='vp|ve|iddpm|edm', type=click.Choice(['vp', 've', 'iddpm', 'edm']))
-@click.option('--schedule',                help='Ablate noise schedule sigma(t)', metavar='vp|ve|linear',           type=click.Choice(['vp', 've', 'linear']))
-@click.option('--scaling',                 help='Ablate signal scaling s(t)', metavar='vp|none',                    type=click.Choice(['vp', 'none']))
+@click.option('--schedule',                help='Ablate noise schedule sigma(t)', metavar='ou|vp|ve|linear',           type=click.Choice(['ou', 'vp', 've', 'linear']))
+@click.option('--scaling',                 help='Ablate signal scaling s(t)', metavar='ou|vp|none',                    type=click.Choice(['ou', 'vp', 'none']))
 
 def main(network_pkl, outdir, subdirs, seeds, class_idx, max_batch_size, device=torch.device('cuda'), **sampler_kwargs):
     """Generate random images using the techniques described in the paper
