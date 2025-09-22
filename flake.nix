@@ -28,6 +28,9 @@
           tqdm
           imageio
           imageio-ffmpeg
+          seaborn
+          matplotlib
+          pandas
           # pyspng
         ]);
         formatters = [ pkgs.black pkgs.isort pkgs.nixpkgs-fmt ];
