@@ -142,6 +142,14 @@ if __name__ == "__main__":
 
     check(rng, scale_t, int_factor, int_int_factor, sample_t)
 
+    c = -2
+    scale_t = lambda t: c
+    int_factor = lambda t: np.exp(-c * t)
+    int_int_factor = lambda t: -np.exp(-c * t) / c
+    sample_t = lambda t, h, u: t - np.log1p(u * np.expm1(- c * h)) / c
+
+    check(rng, scale_t, int_factor, int_int_factor, sample_t)
+
     scale_t = lambda t: -(vp_beta_d * t + vp_beta_min) / 2
     int_factor = lambda t: np.sqrt(1 + sigma(t) ** 2)
     int_int_factor = lambda t: (
