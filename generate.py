@@ -249,6 +249,7 @@ def ablation_sampler(
 
     weight_x = lambda t, t_prime: int_factor(t) / int_factor(t_prime)
     weight_f = lambda t, t_prime: (int_int_factor(t_prime) - int_int_factor(t)) / int_factor(t_prime)
+    weight_z = lambda t, t_prime: torch.sqrt((noise_factor(t_prime) - noise_factor(t)).clamp(min=0)) / int_factor(t_prime)
 
     net_name = type(next(net.modules())).__name__
     networks = ["VPPrecond", "VEPrecond", "iDDPMPrecond", "EDMPrecond"]
@@ -259,6 +260,10 @@ def ablation_sampler(
         if is_edm
         else (lambda t: 1)
     )
+
+    beta_rate = S_churn / (sigma_max - sigma_min)
+    noise_term = lambda t: 0
+    noise_factor = lambda t: 2 * beta_rate * noise_term(torch.clamp(t, S_min, S_max))
 
     if schedule == 'linear' and not handle_skip:
         assert scaling == 'none', f"scaling {scaling} not supported for {schedule} schedule."
@@ -379,7 +384,11 @@ def ablation_sampler(
         x_cur = x_next
 
         # Increase noise temporarily.
-        gamma = min(S_churn / num_steps, np.sqrt(2) - 1) if S_min <= sigma(t_cur) <= S_max else 0
+        if solver != 'midpoint':
+            gamma = min(S_churn / num_steps, np.sqrt(2) - 1) if S_min <= sigma(t_cur) <= S_max else 0
+        # noise in the method later
+        else:
+            gamma = 0
         t_hat = sigma_inv(net.round_sigma(sigma(t_cur) + gamma * sigma(t_cur)))
         x_hat = s(t_hat) / s(t_cur) * x_cur + (sigma(t_hat) ** 2 - sigma(t_cur) ** 2).clip(min=0).sqrt() * s(t_hat) * S_noise * randn_like(x_cur)
 
@@ -420,7 +429,10 @@ def ablation_sampler(
             # Step 2: Compute midpoint using Equation 7
             exp_x_mid = weight_x(t_hat, t_mid)
             exp_f_mid = weight_f(t_hat, t_mid)
-            x_mid = exp_x_mid * x_hat + exp_f_mid * f_hat
+            exp_z_mid = weight_z(t_hat, t_mid)
+            z_mid = s(t_mid) * S_noise * randn_like(x_hat)
+            eta_mid = exp_z_mid * z_mid
+            x_mid = exp_x_mid * x_hat + exp_f_mid * f_hat + eta_mid
 
             # Step 3: Compute denoised_mid and score_mid
             denoised_mid = net(x_mid / s(t_mid), sigma(t_mid), class_labels).to(torch.float64)
@@ -430,7 +442,11 @@ def ablation_sampler(
             # Step 4: Compute x_next using Equation 8
             exp_x_next = weight_x(t_hat, t_next)
             exp_f_next = importance_weight(t_hat, t_mid, t_next)
-            x_next = exp_x_next * x_hat + exp_f_next * f_mid
+            exp_e_next = weight_x(t_mid, t_next)
+            exp_z_next = weight_z(t_mid, t_next)
+            z_next = s(t_next) * S_noise * randn_like(x_hat)
+            eta_next = exp_e_next * eta_mid + exp_z_next * z_next
+            x_next = exp_x_next * x_hat + exp_f_next * f_mid + eta_next
 
             # costly model evaluations, so disabled by default
             if check_skip:
