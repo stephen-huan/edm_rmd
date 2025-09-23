@@ -293,6 +293,7 @@ def ablation_sampler(
             * torch.tanh(x := (1 - u) * int_int_factor(t) + u * int_int_factor(t + h))
             * torch.cosh(x)
         )
+        noise_term = lambda t: t - net.sigma_data * torch.atan(t / net.sigma_data)
     elif schedule == 've' and not handle_skip:
         assert scaling == 'none', f"scaling {scaling} not supported for {schedule} schedule."
         assert is_edm, "non-edm preconditioning not supported."
