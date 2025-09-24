@@ -216,10 +216,6 @@ def ablation_sampler(
     beta = lambda t: ((S_min <= t) & (t <= S_max)) * beta_rate
     noise_factor = lambda t: 2 * beta_rate * noise_t(torch.clip(t, S_min, S_max))
 
-    # FIX: ad-hoc
-    if schedule == 'linear' and S_churn == 0:
-        rel_score = False
-
     sigma_stationary = sigma_max
     if schedule == 'linear' and not rel_score:
         linear_term = lambda t: 0
