@@ -16,62 +16,19 @@ import pickle
 import numpy as np
 from scipy.integrate import quad
 from scipy.optimize import root_scalar
-from scipy.special import dawsn
+from scipy.special import dawsn, erf
 import torch
 import PIL.Image
 import dnnlib
 from torch_utils import distributed as dist
 
-# combined forward pass from training/networks.py
 
-def model_forward(self, x, sigma, class_labels=None, force_fp32=False, no_skip=False, **model_kwargs):
-    x = x.to(torch.float32)
-    sigma = sigma.to(torch.float32).reshape(-1, 1, 1, 1)
-    class_labels = None if self.label_dim == 0 else torch.zeros([1, self.label_dim], device=x.device) if class_labels is None else class_labels.to(torch.float32).reshape(-1, self.label_dim)
-    dtype = torch.float16 if (self.use_fp16 and not force_fp32 and x.device.type == 'cuda') else torch.float32
-
-    net_name = type(next(self.modules())).__name__
-    c_skip, c_out, c_in, c_noise = {
-        "VPPrecond": lambda self: (
-            1,
-            -sigma,
-            1 / (sigma ** 2 + 1).sqrt(),
-            (self.M - 1) * self.sigma_inv(sigma),
-        ),
-        "VEPrecond": lambda self: (
-            1,
-            sigma,
-            1,
-            (0.5 * sigma).log(),
-        ),
-        "iDDPMPrecond": lambda self: (
-            1,
-            -sigma,
-            1 / (sigma ** 2 + 1).sqrt(),
-            self.M - 1 - self.round_sigma(sigma, return_index=True).to(torch.float32),
-        ),
-        "EDMPrecond": lambda self: (
-            self.sigma_data ** 2 / (sigma ** 2 + self.sigma_data ** 2),
-            sigma * self.sigma_data / (sigma ** 2 + self.sigma_data ** 2).sqrt(),
-            1 / (self.sigma_data ** 2 + sigma ** 2).sqrt(),
-            sigma.log() / 4,
-        ),
-    }[net_name](self)
-    if no_skip:
-        c_skip = 0
-
-    F_x = self.model((c_in * x).to(dtype), c_noise.flatten(), class_labels=class_labels, **model_kwargs)
-    assert F_x.dtype == dtype
-    D_x = c_skip * x + c_out * F_x.to(torch.float32)
-    return D_x
-
-
-def quadrature(f):
+def quadrature(f, points=None):
     """Definite integral of f."""
 
     def integrate(f, t, t_prime):
         """Integral of f from t to t_prime."""
-        return quad(f, t, t_prime)[0]
+        return quad(f, t, t_prime, points=points)[0]
 
     def F(t, t_prime):
         t = t.item() if isinstance(t, torch.Tensor) else t
@@ -112,6 +69,10 @@ def inverse_sample(int_int_factor):
         ).reshape(u.shape)
 
     return sample
+
+
+def allclose(x, y, **kwargs):
+    return torch.allclose(torch.asarray(x, dtype=y.dtype), y, **kwargs)
 
 
 #----------------------------------------------------------------------------
@@ -166,7 +127,7 @@ def ablation_sampler(
     solver='heun', discretization='edm', schedule='linear', scaling='none',
     epsilon_s=1e-3, C_1=0.001, C_2=0.008, M=1000, alpha=1,
     S_churn=0, S_min=0, S_max=float('inf'), S_noise=1,
-    importance_sample=True, handle_skip=True, check_skip=False,
+    importance_sample=True, rel_score=True,
 ):
     assert solver in ['euler', 'heun', 'midpoint']
     assert discretization in ['vp', 've', 'iddpm', 'edm']
@@ -249,95 +210,72 @@ def ablation_sampler(
 
     weight_x = lambda t, t_prime: int_factor(t) / int_factor(t_prime)
     weight_f = lambda t, t_prime: (int_int_factor(t_prime) - int_int_factor(t)) / int_factor(t_prime)
-    weight_z = lambda t, t_prime: torch.sqrt((noise_factor(t_prime) - noise_factor(t)).clamp(min=0)) / int_factor(t_prime)
+    weight_z = lambda t, t_prime: torch.sqrt(torch.abs(torch.asarray(noise_factor(t_prime) - noise_factor(t)))) / int_factor(t_prime)
 
-    net_name = type(next(net.modules())).__name__
-    networks = ["VPPrecond", "VEPrecond", "iDDPMPrecond", "EDMPrecond"]
-    assert net_name in networks, f"unknown network {net_name}."
-    is_edm = net_name == "EDMPrecond"
-    c_skip = (
-        (lambda t: net.sigma_data**2 / (sigma(t) ** 2 + net.sigma_data**2))
-        if is_edm
-        else (lambda t: 1)
-    )
+    beta_rate = S_churn / (sigma_max - sigma_min) * S_noise**2
+    beta = lambda t: ((S_min <= t) & (t <= S_max)) * beta_rate
+    noise_factor = lambda t: 2 * beta_rate * noise_t(torch.clip(t, S_min, S_max))
 
-    beta_rate = S_churn / (sigma_max - sigma_min)
-    noise_term = lambda t: 0
-    noise_factor = lambda t: 2 * beta_rate * noise_term(torch.clamp(t, S_min, S_max))
-
-    if schedule == 'linear' and not handle_skip:
-        assert scaling == 'none', f"scaling {scaling} not supported for {schedule} schedule."
+    sigma_stationary = sigma_max
+    if schedule == 'linear' and not rel_score:
         linear_term = lambda t: 0
-        # scale_t(t) = sigma_deriv(t) / sigma(t) + s_deriv(t) / s(t)
-        scale_t = lambda t: 1 / t
-        # int_factor(t) = exp(int -scale_t(t) dt)
-        int_factor = lambda t: 1 / t
-        # int_int_factor(t) = int int_factor(t) dt
-        int_int_factor = lambda t: torch.log(t)
-        # sample_t(t, h, u) = int_int^{-1}((1 - u) * int_int(t) + u * int_int(t + h))
-        sample_t = lambda t, h, u: t * torch.pow(1 + h / t, u)
-        # optional, for numerical stability
-        weight_x = lambda t, t_prime: t_prime / t
-        weight_f = lambda t, t_prime: t_prime * (torch.log(t_prime) - torch.log(t))
-    elif schedule == 'linear' and handle_skip:
+        scale_t = lambda t: 0
+        int_factor = lambda t: 1
+        int_int_factor = lambda t: t
+        sample_t = lambda t, h, u: t + h * u
+        noise_t = lambda t: t**3 / 3
+    elif schedule == 'linear' and rel_score:
         assert scaling == 'none', f"scaling {scaling} not supported for {schedule} schedule."
-        assert is_edm, "non-edm preconditioning not supported."
-        # remove internal skip connection in net
-        linear_term = lambda t: c_skip(t) * sigma_deriv(t) / sigma(t)
-        # scale_t(t) = (1 - c_skip(t)) sigma_deriv(t) / sigma(t) + s_deriv(t) / s(t)
-        scale_t = lambda t: t / (t**2 + net.sigma_data**2)
-        int_factor = lambda t: 1 / torch.sqrt(t**2 + net.sigma_data**2)
-        int_int_factor = lambda t: torch.atanh(t / torch.sqrt(t**2 + net.sigma_data**2))
-        sample_t = (
-            lambda t, h, u: net.sigma_data
-            * torch.tanh(x := (1 - u) * int_int_factor(t) + u * int_int_factor(t + h))
-            * torch.cosh(x)
-        )
-    elif schedule == 've' and not handle_skip:
-        assert scaling == 'none', f"scaling {scaling} not supported for {schedule} schedule."
-        assert is_edm, "non-edm preconditioning not supported."
+        sigma_stationary = sigma_max
         linear_term = lambda t: 0
-        scale_t = lambda t: 1 / (2 * t)
-        int_factor = lambda t: 1 / torch.sqrt(t)
-        int_int_factor = lambda t: 2 * torch.sqrt(t)
-        sample_t = lambda t, h, u: torch.square(
-            (1 - u) * torch.sqrt(t) + u * torch.sqrt(t + h)
+        scale_t = lambda t: (t + beta(t) * t**2) / sigma_stationary**2
+        int_factor = lambda t: torch.exp(
+            -(t**2 / 2 + beta_rate * torch.clip(t, S_min, S_max) ** 3 / 3)
+            / sigma_stationary**2
         )
-    elif schedule == 've' and handle_skip:
-        assert scaling == 'none', f"scaling {scaling} not supported for {schedule} schedule."
-        linear_term = lambda t: c_skip(t) * sigma_deriv(t) / sigma(t)
-        scale_t = lambda t: 1 / (2 * (t + net.sigma_data**2))
-        int_factor = lambda t: 1 / torch.sqrt(t + net.sigma_data**2)
-        int_int_factor = lambda t: 2 * torch.sqrt(t + net.sigma_data**2)
-        sample_t = (
-            lambda t, h, u: torch.square(
-                (1 - u) * torch.sqrt(t + net.sigma_data**2)
-                + u * torch.sqrt(t + h + net.sigma_data**2)
-            )
-            - net.sigma_data**2
+        int_factor_np = lambda t: np.exp(
+            -(t**2 / 2 + beta_rate * np.clip(t, S_min, S_max) ** 3 / 3)
+            / sigma_stationary**2
         )
-    elif schedule == 'vp' and not handle_skip:
-        raise ValueError(f"cannot ignore skip connection for {schedule} schedule.")
-    elif schedule == 'vp' and handle_skip and is_edm:
-        assert scaling == 'vp', f"scaling {scaling} not supported for {schedule} schedule."
-        linear_term = lambda t: c_skip(t) * sigma_deriv(t) / sigma(t)
-        scale_t = (
-            lambda t: (1 - net.sigma_data**2)
-            * (vp_beta_d * t + vp_beta_min)
-            / (2 * (sigma(t) ** 2 + net.sigma_data**2))
-        )
-        int_factor = lambda t: torch.sqrt(
-            (sigma(t) ** 2 + 1) / (sigma(t) ** 2 + net.sigma_data**2)
-        )
-        int_factor_np = lambda t: np.sqrt(
-            (sigma(t) ** 2 + 1) / (sigma(t) ** 2 + net.sigma_data**2)
-        )
-        int_int_diff = quadrature(int_factor_np)
+        int_int_diff = quadrature(int_factor_np, points=[S_min, S_max])
         sample_t = inverse_sample(int_int_diff)
         weight_f = lambda t, t_prime: int_int_diff(t, t_prime) / int_factor(t_prime)
-    elif schedule == 'vp' and handle_skip and not is_edm:
+        noise_diff = quadrature(
+            lambda t: np.square(int_factor_np(t) * t), points=[S_min, S_max]
+        )
+        noise_t = lambda t: noise_diff(0, t)
+    elif schedule == 've' and not rel_score:
+        assert scaling == 'none', f"scaling {scaling} not supported for {schedule} schedule."
+        linear_term = lambda t: 0
+        scale_t = lambda t: 0
+        int_factor = lambda t: 1
+        int_int_factor = lambda t: t
+        sample_t = lambda t, h, u: t + h * u
+        noise_t = lambda t: t**2 / 2
+    elif schedule == 've' and rel_score:
+        assert scaling == 'none', f"scaling {scaling} not supported for {schedule} schedule."
+        sigma_stationary = sigma_max
+        linear_term = lambda t: 0
+        scale_t = lambda t: (0.5 + beta(t) * t) / sigma_stationary**2
+        int_factor = lambda t: torch.exp(
+            -(t / 2 + beta_rate * torch.clip(t, S_min, S_max) ** 2 / 2)
+            / sigma_stationary**2
+        )
+        int_factor_np = lambda t: np.exp(
+            -(t / 2 + beta_rate * np.clip(t, S_min, S_max) ** 2 / 2)
+            / sigma_stationary**2
+        )
+        int_int_diff = quadrature(int_factor_np, points=[S_min, S_max])
+        sample_t = inverse_sample(int_int_diff)
+        weight_f = lambda t, t_prime: int_int_diff(t, t_prime) / int_factor(t_prime)
+        noise_diff = quadrature(
+            lambda t: np.square(int_factor_np(t) * t), points=[S_min, S_max]
+        )
+        noise_t = lambda t: noise_diff(0, t)
+    elif schedule == 'vp' and not rel_score:
         assert scaling == 'vp', f"scaling {scaling} not supported for {schedule} schedule."
-        linear_term = lambda t: c_skip(t) * sigma_deriv(t) / sigma(t)
+        sigma_stationary = 1
+        linear_term = lambda t: 0
         scale_t = lambda t: -(vp_beta_d * t + vp_beta_min) / 2
         int_factor = lambda t: torch.sqrt(1 + sigma(t) ** 2)
         int_int_factor_np = lambda t: (
@@ -353,18 +291,102 @@ def ablation_sampler(
         )
         int_int_diff = lambda t, t_prime: int_int_factor_np(t_prime) - int_int_factor_np(t)
         sample_t = inverse_sample(int_int_diff)
+        sigma_np = lambda t: np.sqrt(
+            np.expm1(0.5 * vp_beta_d * t**2 + vp_beta_min * t)
+        )
+        s_np = lambda t: 1 / np.sqrt(sigma_np(t) ** 2 + 1)
+        int_factor_np = lambda t: np.sqrt(1 + sigma_np(t) ** 2)
+        noise_diff = quadrature(
+            lambda t: np.square(int_factor_np(t) * sigma_np(t) * s_np(t)),
+            points=[S_min, S_max],
+        )
+        noise_t = lambda t: noise_diff(0, t)
+    elif schedule == 'vp' and rel_score:
+        assert scaling == 'vp', f"scaling {scaling} not supported for {schedule} schedule."
+        sigma_stationary = 1
+        linear_term = lambda t: 0
+        scale_t = (
+            lambda t: (1 - sigma_stationary**2)
+            * (vp_beta_d * t + vp_beta_min)
+            / (2 * sigma_stationary**2)
+            + sigma(t) ** 2 / (sigma(t) ** 2 + 1) * beta(t) / sigma_stationary**2
+        )
+        int_left = (
+            lambda t: (1 - sigma_stationary**2)
+            * (vp_beta_d * t**2 / 2 + vp_beta_min * t)
+            / (2 * sigma_stationary**2)
+        )
+        int_right_in = (
+            lambda t: beta_rate
+            * (
+                t
+                - np.sqrt(torch.pi / (2 * vp_beta_d))
+                * np.exp(vp_beta_min**2 / (2 * vp_beta_d))
+                * torch.erf((vp_beta_d * t + vp_beta_min) / np.sqrt(2 * vp_beta_d))
+            )
+            / sigma_stationary**2
+        )
+        int_factor = lambda t: torch.exp(
+            -(int_left(t) + int_right_in(torch.clip(t, S_min, S_max)))
+        )
+        int_right_in_np = (
+            lambda t: beta_rate
+            * (
+                t
+                - np.sqrt(np.pi / (2 * vp_beta_d))
+                * np.exp(vp_beta_min**2 / (2 * vp_beta_d))
+                * erf((vp_beta_d * t + vp_beta_min) / np.sqrt(2 * vp_beta_d))
+            )
+            / sigma_stationary**2
+        )
+        int_factor_np = lambda t: np.exp(
+            -(int_left(t) + int_right_in_np(np.clip(t, S_min, S_max)))
+        )
+        int_int_diff = quadrature(int_factor_np, points=[S_min, S_max])
+        int_int_factor = lambda t: int_int_diff(0, t)
+        sample_t = inverse_sample(int_int_diff)
+        sigma_np = lambda t: np.sqrt(
+            np.expm1(0.5 * vp_beta_d * t**2 + vp_beta_min * t)
+        )
+        s_np = lambda t: 1 / np.sqrt(sigma_np(t) ** 2 + 1)
+        noise_diff = quadrature(
+            lambda t: np.square(int_factor_np(t) * sigma_np(t) * s_np(t)),
+            points=[S_min, S_max],
+        )
+        noise_t = lambda t: noise_diff(0, t)
+    elif schedule == 'ou' and rel_score and S_churn == 0:
+        assert scaling == 'ou', f"scaling {scaling} not supported for {schedule} schedule."
+        sigma_stationary = 1
+        linear_term = lambda t: 0
+        scale_t = lambda t: 0
+        int_factor = lambda t: 1
+        int_int_factor = lambda t: t
+        sample_t = lambda t, h, u: t + h * u
+        noise_t = lambda t: 0
+    elif schedule == 'ou':
+        assert scaling == 'ou', f"scaling {scaling} not supported for {schedule} schedule."
+        sigma_stationary = 1
+        c = +1 if rel_score and S_churn > 0 else -1
+        linear_term = lambda t: 0
+        scale_t = lambda t: c
+        int_factor = lambda t: torch.exp(-c * t)
+        int_int_factor = lambda t: -torch.exp(-c * t) / c
+        sample_t = lambda t, h, u: t - torch.log1p(u * torch.expm1(-c * h)) / c
+        weight_x = lambda t, t_prime: torch.exp(c * (t_prime - t))
+        weight_f = lambda t, t_prime: (weight_x(t, t_prime) - 1) / c
+        if S_churn > 0:
+            beta = lambda t: 1 / (sigma(t) * s(t)) ** 2
+            noise_factor = lambda t: -torch.exp(-2 * c * t) / c
+        else:
+            noise_t = lambda t: 0
     else:
-        # generic implementation (exponential integrator)
-        # subtract 1 to remove the exponentially integrated x
-        linear_term = lambda t: sigma_deriv(t) / sigma(t) + s_deriv(t) / s(t) - 1
-        scale_t = lambda t: 1
-        int_factor = lambda t: torch.exp(-t)
-        int_int_factor = lambda t: -torch.exp(-t)
-        # numerically robust implementation of log1p(u * expm1(-h))
-        sample_t = lambda t, h, u: t - torch.logaddexp(torch.log1p(-u), torch.log(u) - h)
-        weight_x = lambda t, t_prime: torch.exp(t_prime - t)
-        weight_f = lambda t, t_prime: weight_x(t, t_prime) - 1
-        raise ValueError(f"unsupported combination schedule {schedule} scaling {scaling}.")
+        linear_term = lambda t: 0
+        scale_t = lambda t: 0
+        int_factor = lambda t: 1
+        int_int_factor = lambda t: t
+        sample_t = lambda t, h, u: t + h * u
+        noise_t = lambda t: 0
+        raise ValueError(f"unsupported schedule {schedule} scaling {scaling}.")
 
     if importance_sample:
         importance_weight = lambda t, t_mid, t_prime: weight_f(t, t_prime)
@@ -408,77 +430,83 @@ def ablation_sampler(
             x_next = x_hat + h * ((1 - 1 / (2 * alpha)) * d_cur + 1 / (2 * alpha) * d_prime)
         else:
             assert solver == 'midpoint'
-            if i == num_steps - 1 and (
-                (schedule == "linear" or schedule == "ve") and not handle_skip
-            ):
-                x_next = x_hat + h * d_cur
-                continue
-            # Full Shen-Lee randomized midpoint method with exponential weighting
-            # From equations 7 and 8 of https://arxiv.org/pdf/2406.00924
-
-            # Sample random value uniformly from [0, 1]
             u = rand((latents.shape[0], 1, 1, 1), dtype=torch.float64, device=latents.device)
 
-            # Compute the randomized midpoint time
             t_mid = sample_t(t_hat, h, u)
+            t_mid = sigma_inv(net.round_sigma(sigma(t_mid)))
 
-            # Step 1: Compute the score from denoised
-            g_hat = sigma_deriv(t_hat) * s(t_hat) / sigma(t_hat) * denoised
+            score_hat = (denoised - x_hat / s(t_hat)) / (s(t_hat) * sigma(t_hat) ** 2)
+            rel_score_hat = score_hat - rel_score * (-x_hat / sigma_stationary**2)
+            g_hat = s(t_hat) ** 2 * sigma_deriv(t_hat) * sigma(t_hat) * rel_score_hat
+            g_hat += s(t_hat) ** 2 * beta(t_hat) * sigma(t_hat) ** 2 * rel_score_hat
             f_hat = linear_term(t_hat) * x_hat - g_hat
 
-            # Step 2: Compute midpoint using Equation 7
             exp_x_mid = weight_x(t_hat, t_mid)
             exp_f_mid = weight_f(t_hat, t_mid)
             exp_z_mid = weight_z(t_hat, t_mid)
-            z_mid = s(t_mid) * S_noise * randn_like(x_hat)
+            z_mid = randn_like(x_hat)
             eta_mid = exp_z_mid * z_mid
             x_mid = exp_x_mid * x_hat + exp_f_mid * f_hat + eta_mid
 
-            # Step 3: Compute denoised_mid and score_mid
             denoised_mid = net(x_mid / s(t_mid), sigma(t_mid), class_labels).to(torch.float64)
-            g_mid = sigma_deriv(t_mid) * s(t_mid) / sigma(t_mid) * denoised_mid
+            score_mid = (denoised_mid - x_mid / s(t_mid)) / (s(t_mid) * sigma(t_mid) ** 2)
+            rel_score_mid = score_mid - rel_score * (-x_mid / sigma_stationary**2)
+            g_mid = s(t_mid) ** 2 * sigma_deriv(t_mid) * sigma(t_mid) * rel_score_mid
+            g_mid += s(t_mid) ** 2 * beta(t_mid) * sigma(t_mid) ** 2 * rel_score_mid
             f_mid = linear_term(t_mid) * x_mid - g_mid
 
-            # Step 4: Compute x_next using Equation 8
             exp_x_next = weight_x(t_hat, t_next)
             exp_f_next = importance_weight(t_hat, t_mid, t_next)
             exp_e_next = weight_x(t_mid, t_next)
             exp_z_next = weight_z(t_mid, t_next)
-            z_next = s(t_next) * S_noise * randn_like(x_hat)
+            z_next = randn_like(x_hat)
             eta_next = exp_e_next * eta_mid + exp_z_next * z_next
             x_next = exp_x_next * x_hat + exp_f_next * f_mid + eta_next
 
-            # costly model evaluations, so disabled by default
-            if check_skip:
-                skip = model_forward(net, x_hat / s(t_hat), sigma(t_hat), class_labels).to(torch.float64)
-                assert torch.allclose(skip, denoised), 'model_forward wrong.'
-                no_skip = model_forward(net, x_hat / s(t_hat), sigma(t_hat), class_labels, no_skip=True).to(torch.float64)
-                assert torch.allclose(no_skip + c_skip(t_hat) * x_hat / s(t_hat), denoised, atol=1e-6), 'c_skip wrong.'
-            assert torch.allclose(scale_t(t_hat) * x_hat + f_hat, d_cur, atol=1e-4), 'scale_t and linear_term wrong.'
+            # sanity checks
+            h_hat = (s_deriv(t_hat) / s(t_hat)) * x_hat
+            h_hat -= s(t_hat) ** 2 * sigma_deriv(t_hat) * sigma(t_hat) * score_hat
+            h_hat -= s(t_hat) ** 2 * beta(t_hat) * sigma(t_hat) ** 2 * score_hat
+            x_term = s_deriv(t_hat) / s(t_hat)
+            if rel_score:
+                x_term += s(t_hat) ** 2 * sigma_deriv(t_hat) * sigma(t_hat) / sigma_stationary**2
+                x_term += s(t_hat) ** 2 * beta(t_hat) * sigma(t_hat) ** 2 / sigma_stationary**2
+            if beta(t_hat) == 0:
+                assert allclose(h_hat, d_cur), 'h_hat wrong.'
+                assert allclose(scale_t(t_hat) * x_hat + f_hat, d_cur, atol=1e-4), 'scale_t and linear_term wrong.'
+            assert allclose(linear_term(t_hat) + scale_t(t_hat), torch.asarray(x_term)), 'scale_t wrong.'
+            assert allclose(x_term * x_hat - g_hat, h_hat), 'g_hat and h_hat wrong.'
             tau = t_mid - t_hat
             assert ((h <= tau) & (tau <= 0)).all(), 't_mid out of valid range.'
-            if schedule == 'linear' and not handle_skip:
-                assert torch.allclose(exp_x_mid, 1 + tau / t_hat), 'exp_x_mid wrong.'
-                assert torch.allclose(exp_f_mid, t_mid * torch.log(exp_x_mid)), 'exp_f_mid wrong.'
-                assert torch.allclose(exp_x_next, 1 + h / t_hat), 'exp_x_next wrong.'
-                target = t_next * (torch.log(exp_x_next) if importance_sample else h / t_mid)
-                assert torch.allclose(exp_f_next, target), 'exp_f_next wrong.'
-            elif schedule == 'linear' and handle_skip:
+            if schedule == 'linear':
                 ...
-            elif schedule == 've' and not handle_skip:
+            elif schedule == 've':
                 ...
-            elif schedule == 've' and handle_skip:
+            elif schedule == 'vp':
                 ...
-            elif schedule == 'vp' and not handle_skip:
-                ...
-            elif schedule == 'vp' and handle_skip:
-                ...
-            else:
-                assert torch.allclose(exp_x_mid, torch.exp(tau)), 'exp_x_mid wrong.'
-                assert torch.allclose(exp_f_mid, exp_x_mid - 1), 'exp_f_mid wrong.'
-                assert torch.allclose(exp_x_next, torch.exp(h)), 'exp_x_next wrong.'
+            elif schedule == 'ou' and not rel_score:
+                assert allclose(exp_x_mid, torch.exp(-tau)), 'exp_x_mid wrong.'
+                assert allclose(exp_f_mid, 1 - exp_x_mid), 'exp_f_mid wrong.'
+                assert allclose(exp_z_mid, (S_churn > 0) * torch.sqrt(torch.expm1(-2 * tau))), 'exp_z_mid wrong.'
+                assert allclose(exp_x_next, torch.exp(-h)), 'exp_x_next wrong.'
+                target = (1 - exp_x_next) if importance_sample else (h * torch.exp(tau - h))
+                assert allclose(exp_f_next, target), 'exp_f_next wrong.'
+                assert allclose(exp_e_next, torch.exp(tau - h)), 'exp_e_next wrong.'
+                assert allclose(exp_z_next, (S_churn > 0) * torch.sqrt(torch.expm1(2 * (tau - h)))), 'exp_z_next wrong.'
+            elif schedule == 'ou' and rel_score and S_churn > 0:
+                assert allclose(exp_x_mid, torch.exp(+tau)), 'exp_x_mid wrong.'
+                assert allclose(exp_f_mid, exp_x_mid - 1), 'exp_f_mid wrong.'
+                assert allclose(exp_z_mid, torch.sqrt(torch.clip(-torch.expm1(2 * tau), min=0))), 'exp_z_mid wrong.'
+                assert allclose(exp_x_next, torch.exp(+h)), 'exp_x_next wrong.'
                 target = (exp_x_next - 1) if importance_sample else (h * torch.exp(h - tau))
-                assert torch.allclose(exp_f_next, target), 'exp_f_next wrong.'
+                assert allclose(exp_f_next, target), 'exp_f_next wrong.'
+                assert allclose(exp_e_next, torch.exp(h - tau)), 'exp_e_next wrong.'
+                assert allclose(exp_z_next, torch.sqrt(torch.clip(-torch.expm1(2 * (h - tau)), min=0))), 'exp_z_next wrong.'
+            else:
+                assert allclose(exp_x_mid, torch.ones(())), 'exp_x_mid wrong.'
+                assert allclose(exp_f_mid, t_mid - t_hat), 'exp_f_mid wrong.'
+                assert allclose(exp_x_next, torch.ones(())), 'exp_x_next wrong.'
+                assert allclose(exp_f_next, t_next - t_hat), 'exp_f_next wrong.'
 
     return x_next
 
