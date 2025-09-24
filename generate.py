@@ -577,6 +577,7 @@ def parse_int_list(s):
 @click.option('--disc', 'discretization',  help='Ablate time step discretization {t_i}', metavar='vp|ve|iddpm|edm', type=click.Choice(['vp', 've', 'iddpm', 'edm']))
 @click.option('--schedule',                help='Ablate noise schedule sigma(t)', metavar='ou|vp|ve|linear',           type=click.Choice(['ou', 'vp', 've', 'linear']))
 @click.option('--scaling',                 help='Ablate signal scaling s(t)', metavar='ou|vp|none',                    type=click.Choice(['ou', 'vp', 'none']))
+@click.option('--rel_score/--no-rel_score',help='Abalate relative score', metavar='BOOL',                           type=click.BOOL, default=True, show_default=True)
 
 def main(network_pkl, outdir, subdirs, seeds, class_idx, max_batch_size, device=torch.device('cuda'), **sampler_kwargs):
     """Generate random images using the techniques described in the paper
