@@ -1,7 +1,7 @@
 import numpy as np
 from scipy.integrate import quad
 from scipy.optimize import root_scalar
-from scipy.special import dawsn
+from scipy.special import dawsn, erf
 from scipy.stats import gmean
 
 
@@ -48,14 +48,21 @@ def order_sample(int_int_factor, int_factor, scale_t):
     )
 
 
+def split_quad(f, a, b):
+    return quad(f, a, b, points=[S_min, S_max])[0]
+
+
 def check(
     rng,
     scale_t,
     int_factor,
-    int_int_factor,
-    sample_t,
-    a=0,
-    b=5,
+    int_int_factor=None,
+    sample_t=None,
+    noise_t=None,
+    sigma=None,
+    s=None,
+    a=0.0,
+    b=5.0,
     num=int(1e3),
     h=0.1,
 ):
@@ -63,17 +70,31 @@ def check(
     # remove 0
     t += t[1]
 
-    g = np.exp(-np.array([quad(scale_t, t[0], t0)[0] for t0 in t]))
-    g *= gmean(int_factor(t) / g)
-    assert np.allclose(int_factor(t), g), "int_factor wrong."
+    if scale_t is not None and int_factor is not None:
+        g = np.exp(-np.array([split_quad(scale_t, t[0], t0) for t0 in t]))
+        g *= gmean(int_factor(t) / g)
+        assert np.allclose(int_factor(t), g), "int_factor wrong."
 
     if int_int_factor is not None:
-        G = np.array([quad(int_factor, t[0], t0)[0] for t0 in t])
+        G = np.array([split_quad(int_factor, t[0], t0) for t0 in t])
         assert np.allclose(
             int_int_factor(t) - int_int_factor(t[0]), G
         ), "int_int_factor wrong."
 
-    if sample_t is None:
+    if noise_t is not None:
+        assert (
+            int_factor is not None and sigma is not None and s is not None
+        ), "need int_factor and sigma and s."
+        f = lambda t: np.square(int_factor(t) * sigma(t) * s(t))
+        G = np.array([split_quad(f, t[0], t0) for t0 in t])
+        assert np.allclose(noise_t(t) - noise_t(t[0]), G), "noise_t wrong."
+
+    if (
+        sample_t is None
+        or scale_t is None
+        or int_factor is None
+        or int_int_factor is None
+    ):
         return
 
     int_diff = lambda t, t_prime: int_int_factor(t_prime) - int_int_factor(t)
@@ -94,6 +115,16 @@ if __name__ == "__main__":
     sigma = lambda t: np.sqrt(
         np.exp(0.5 * vp_beta_d * t**2 + vp_beta_min * t) - 1
     )
+    sigma_max = 80
+    sigma_min = 0.002
+    sigma_stationary = 2
+    S_churn = 40
+    S_min = 0.05
+    S_max = 50 / 20
+    S_noise = 1.003
+
+    beta_rate = S_churn / (sigma_max - sigma_min) * S_noise**2
+    beta = lambda t: ((S_min <= t) & (t <= S_max)) * beta_rate
 
     scale_t = lambda t: 1 / t
     int_factor = lambda t: 1 / t
@@ -142,6 +173,25 @@ if __name__ == "__main__":
 
     check(rng, scale_t, int_factor, int_int_factor, sample_t)
 
+    scale_t = lambda t: 0
+    int_factor = lambda t: 1
+    int_int_factor = lambda t: t
+    sample_t = lambda t, h, u: t + h * u
+
+    check(rng, scale_t, int_factor, int_int_factor, sample_t)
+
+    sigma_t = lambda t: t
+    s = lambda t: 1
+    noise_t = lambda t: t**3 / 3
+
+    check(rng, scale_t, int_factor, noise_t=noise_t, sigma=sigma_t, s=s)
+
+    sigma_t = lambda t: np.sqrt(t)
+    s = lambda t: 1
+    noise_t = lambda t: t**2 / 2
+
+    check(rng, scale_t, int_factor, noise_t=noise_t, sigma=sigma_t, s=s)
+
     scale_t = lambda t: -(vp_beta_d * t + vp_beta_min) / 2
     int_factor = lambda t: np.sqrt(1 + sigma(t) ** 2)
     int_int_factor = lambda t: (
@@ -166,8 +216,115 @@ if __name__ == "__main__":
     int_factor = lambda t: np.sqrt(
         (sigma(t) ** 2 + 1) / (sigma(t) ** 2 + sigma_data**2)
     )
-    check(rng, scale_t, int_factor, None, None)
+    check(rng, scale_t, int_factor)
 
+    scale_t = lambda t: (t + beta(t) * t**2) / sigma_stationary**2
+    int_factor = lambda t: np.exp(
+        -(t**2 / 2 + beta_rate * np.clip(t, S_min, S_max) ** 3 / 3)
+        / sigma_stationary**2
+    )
+
+    check(rng, scale_t, int_factor)
+
+    scale_t = lambda t: (0.5 + beta(t) * t) / sigma_stationary**2
+    int_factor = lambda t: np.exp(
+        -(t / 2 + beta_rate * np.clip(t, S_min, S_max) ** 2 / 2)
+        / sigma_stationary**2
+    )
+
+    trunc_case = (
+        lambda endpoint, t: -2
+        * sigma_stationary**2
+        * np.exp(-(endpoint**2 * beta_rate + t) / (2 * sigma_stationary**2))
+    )
+    int_factor_trunc = lambda t: np.exp(
+        -(t / 2 + beta_rate * S_min**2 / 2) / sigma_stationary**2
+    )
+    check(rng, None, int_factor_trunc, lambda t: trunc_case(S_min, t))
+
+    in_case = (
+        lambda t: sigma_stationary
+        * np.exp(1 / (8 * beta_rate * sigma_stationary**2))
+        * np.sqrt(np.pi / (2 * beta_rate))
+        * erf(
+            (2 * beta_rate * t + 1)
+            / (2 * np.sqrt(2 * beta_rate) * sigma_stationary)
+        )
+    )
+    int_factor_untrunc = lambda t: np.exp(
+        -(t / 2 + beta_rate * t**2 / 2) / sigma_stationary**2
+    )
+    check(rng, None, int_factor_untrunc, in_case)
+
+    int_int_factor = lambda t: np.where(
+        t <= S_min,
+        trunc_case(S_min, t) - trunc_case(S_min, 0),
+        np.where(
+            t <= S_max,
+            trunc_case(S_min, S_min)
+            - trunc_case(S_min, 0)
+            + in_case(t)
+            - in_case(S_min),
+            trunc_case(S_min, S_min)
+            - trunc_case(S_min, 0)
+            + in_case(S_max)
+            - in_case(S_min)
+            + trunc_case(S_max, t)
+            - trunc_case(S_max, S_max),
+        ),
+    )
+
+    check(rng, scale_t, int_factor, int_int_factor)
+
+    scale_t = (
+        lambda t: (
+            (1 - sigma_stationary**2) * (vp_beta_d * t + vp_beta_min) / 2
+            + sigma(t) ** 2 / (sigma(t) ** 2 + 1) * beta(t)
+        )
+        / sigma_stationary**2
+    )
+    scale_t_left = lambda t: (
+        (1 - sigma_stationary**2)
+        * (vp_beta_d * t + vp_beta_min)
+        / (2 * sigma_stationary**2)
+    )
+    scale_t_right = (
+        lambda t: sigma(t) ** 2
+        / (sigma(t) ** 2 + 1)
+        * beta(t)
+        / sigma_stationary**2
+    )
+
+    int_left = (
+        lambda t: (1 - sigma_stationary**2)
+        * (vp_beta_d * t**2 / 2 + vp_beta_min * t)
+        / (2 * sigma_stationary**2)
+    )
+    check(rng, None, scale_t_left, int_left)
+
+    int_right_in = (
+        lambda t: beta_rate
+        * (
+            t
+            - np.sqrt(np.pi / (2 * vp_beta_d))
+            * np.exp(vp_beta_min**2 / (2 * vp_beta_d))
+            * erf((vp_beta_d * t + vp_beta_min) / np.sqrt(2 * vp_beta_d))
+        )
+        / sigma_stationary**2
+    )
+    check(
+        rng,
+        None,
+        scale_t_right,
+        lambda t: int_right_in(np.clip(t, S_min, S_max)),
+    )
+
+    int_factor = lambda t: np.exp(
+        -(int_left(t) + int_right_in(np.clip(t, S_min, S_max)))
+    )
+    check(rng, scale_t, int_factor)
+
+    int_factor = lambda t: np.exp(-t)
     int_diff = lambda t, t_prime: quad(int_factor, t, t_prime)[0]
 
     t = np.array([0.01])
