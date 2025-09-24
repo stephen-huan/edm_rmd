@@ -16,6 +16,7 @@ def generate(
     disc: str,
     schedule: str,
     scaling: str,
+    rel_score: bool,
 ) -> None:
     subprocess.run(
         [
@@ -32,6 +33,7 @@ def generate(
             f"--schedule={schedule}",
             f"--scaling={scaling}",
             f"--network={network}",
+            *(["--rel_score"] if rel_score else ["--no-rel_score"]),
         ]
     )
 
@@ -47,6 +49,7 @@ if __name__ == "__main__":
     parser.add_argument("--disc", type=str)
     parser.add_argument("--schedule", type=str)
     parser.add_argument("--scaling", type=str)
+    parser.add_argument("--rel_score", action=argparse.BooleanOptionalAction)
     args = parser.parse_args()
 
     for seeds, steps, solver in itertools.product(
@@ -55,6 +58,7 @@ if __name__ == "__main__":
         net_name = args.network.split("/")[-1]
         outdir = args.outdir / (
             f"{net_name}_{solver}_{args.disc}_{args.schedule}_{args.scaling}"
+            + f"_{args.rel_score}"
             + f"_{steps:0>4}_{seeds}"
         )
         outdir.mkdir(exist_ok=True, parents=True)
@@ -68,4 +72,5 @@ if __name__ == "__main__":
             disc=args.disc,
             schedule=args.schedule,
             scaling=args.scaling,
+            rel_score=args.rel_score,
         )
