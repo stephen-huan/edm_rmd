@@ -129,7 +129,7 @@ def ablation_sampler(
     S_churn=0, S_min=0, S_max=float('inf'), S_noise=1,
     importance_sample=True, rel_score=True,
 ):
-    assert solver in ['euler', 'heun', 'midpoint']
+    assert solver in ['euler', 'heun', 'midpoint', 'euler-ou', 'euler-exp']
     assert discretization in ['vp', 've', 'iddpm', 'edm']
     assert schedule in ['ou', 'vp', 've', 'linear']
     assert scaling in ['ou', 'vp', 'none']
@@ -428,6 +428,46 @@ def ablation_sampler(
             denoised = net(x_prime / s(t_prime), sigma(t_prime), class_labels).to(torch.float64)
             d_prime = (sigma_deriv(t_prime) / sigma(t_prime) + s_deriv(t_prime) / s(t_prime)) * x_prime - sigma_deriv(t_prime) * s(t_prime) / sigma(t_prime) * denoised
             x_next = x_hat + h * ((1 - 1 / (2 * alpha)) * d_cur + 1 / (2 * alpha) * d_prime)
+        elif solver == 'euler-ou':
+            assert schedule == 'ou', f"only ou supported, not {schedule}."
+            assert scaling == 'ou', f"only ou supported, not {scaling}."
+
+            score_hat = (denoised - x_hat / s(t_hat)) / (s(t_hat) * sigma(t_hat) ** 2)
+            f_hat = (s_deriv(t_hat) / s(t_hat)) * x_hat
+            f_hat -= s(t_hat) ** 2 * sigma_deriv(t_hat) * sigma(t_hat) * score_hat
+            f_hat -= s(t_hat) ** 2 * beta(t_hat) * sigma(t_hat) ** 2 * score_hat
+            assert allclose(-f_hat, x_hat + 2 * score_hat), "score wrong."
+
+            z_next = randn_like(x_hat)
+            eta_next = torch.sqrt(torch.abs(2 * h)) * z_next
+            x_next = x_hat + h * f_hat + eta_next
+        elif solver == 'euler-exp' and not rel_score:
+            assert schedule == 'ou', f"only ou supported, not {schedule}."
+            assert scaling == 'ou', f"only ou supported, not {scaling}."
+
+            score_hat = (denoised - x_hat / s(t_hat)) / (s(t_hat) * sigma(t_hat) ** 2)
+            f_hat = -2 * score_hat
+
+            exp_x_next = torch.exp(-h)
+            exp_f_next = 1 - torch.exp(-h)
+            exp_z_next = torch.sqrt(torch.abs(1 - torch.exp(-2 * h)))
+            z_next = randn_like(x_hat)
+            eta_next = exp_z_next * z_next
+            x_next = exp_x_next * x_hat + exp_f_next * f_hat + eta_next
+        elif solver == 'euler-exp' and rel_score:
+            assert schedule == 'ou', f"only ou supported, not {schedule}."
+            assert scaling == 'ou', f"only ou supported, not {scaling}."
+
+            score_hat = (denoised - x_hat / s(t_hat)) / (s(t_hat) * sigma(t_hat) ** 2)
+            rel_score_hat = score_hat - (-x_hat)
+            f_hat = -2 * rel_score_hat
+
+            exp_x_next = torch.exp(h)
+            exp_f_next = torch.exp(h) - 1
+            exp_z_next = torch.sqrt(torch.abs(torch.exp(2 * h) - 1))
+            z_next = randn_like(x_hat)
+            eta_next = exp_z_next * z_next
+            x_next = exp_x_next * x_hat + exp_f_next * f_hat + eta_next
         else:
             assert solver == 'midpoint'
             u = rand((latents.shape[0], 1, 1, 1), dtype=torch.float64, device=latents.device)
@@ -569,7 +609,7 @@ def parse_int_list(s):
 @click.option('--S_max', 'S_max',          help='Stoch. max noise level', metavar='FLOAT',                          type=click.FloatRange(min=0), default='inf', show_default=True)
 @click.option('--S_noise', 'S_noise',      help='Stoch. noise inflation', metavar='FLOAT',                          type=float, default=1, show_default=True)
 
-@click.option('--solver',                  help='Ablate ODE solver', metavar='euler|heun|midpoint',                 type=click.Choice(['euler', 'heun', 'midpoint']))
+@click.option('--solver',                  help='Ablate ODE solver', metavar='euler|heun|midpoint|euler-ou|euler-exp', type=click.Choice(['euler', 'heun', 'midpoint', 'euler-ou', 'euler-exp']))
 @click.option('--disc', 'discretization',  help='Ablate time step discretization {t_i}', metavar='vp|ve|iddpm|edm', type=click.Choice(['vp', 've', 'iddpm', 'edm']))
 @click.option('--schedule',                help='Ablate noise schedule sigma(t)', metavar='ou|vp|ve|linear',           type=click.Choice(['ou', 'vp', 've', 'linear']))
 @click.option('--scaling',                 help='Ablate signal scaling s(t)', metavar='ou|vp|none',                    type=click.Choice(['ou', 'vp', 'none']))
