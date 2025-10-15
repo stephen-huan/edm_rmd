@@ -31,6 +31,7 @@
           seaborn
           matplotlib
           pandas
+          pycairo
           # pyspng
         ]);
         formatters = [ pkgs.black pkgs.isort pkgs.nixpkgs-fmt ];
