@@ -3,6 +3,12 @@
 Implementation of the [randomized midpoint
 method](http://arxiv.org/abs/1909.05503) for diffusion model sampling.
 
+This code implements the score and relative score choices for
+the linear factor (the so-called "SDE-adapted" choices, see
+C.2.2 "Concrete choices of scaling factor" of the paper). For
+the "network-adapted" denoiser and skip connection choices, see
+the [nn-adapted](https://github.com/stephen-huan/edm_rmd/tree/nn-adapted) tag.
+
 ## License
 
 This repository is forked from [edm](https://github.com/NVlabs/edm) by Tero
