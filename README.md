@@ -1,7 +1,9 @@
 ## Randomized midpoint method
 
-Implementation of the [randomized midpoint
-method](http://arxiv.org/abs/1909.05503) for diffusion model sampling.
+Implementation of (variants of) the [randomized midpoint
+method](http://arxiv.org/abs/1909.05503) for diffusion model
+sampling as part of the paper [_Sublinear iterations can suffice
+even for DDPMs_](https://arxiv.org/abs/2511.04844).
 
 This code implements the score and relative score choices for
 the linear factor (the so-called "SDE-adapted" choices, see
