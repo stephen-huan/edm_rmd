@@ -1,4 +1,4 @@
-## Randomized midpoint method
+## Sublinear iterations can suffice even for DDPMs
 
 Implementation of (variants of) the [randomized midpoint
 method](http://arxiv.org/abs/1909.05503) for diffusion model
