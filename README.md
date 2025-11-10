@@ -34,3 +34,20 @@ All material, including source code and pre-trained models, is licensed under th
 
 `imagenet-64x64-baseline.npz` is derived from the [precomputed reference statistics](https://github.com/openai/guided-diffusion/tree/main/evaluations) by Prafulla Dhariwal and Alex Nichol. The statistics were
 originally shared under the [MIT license](https://github.com/openai/guided-diffusion/blob/main/LICENSE).
+
+## Citation
+
+```bibtex
+@misc{zhang2025sublinear,
+  title = {Sublinear Iterations Can Suffice Even for {{DDPMs}}},
+  author = {Zhang, Matthew S. and Huan, Stephen and Huang, Jerry and Boffi, Nicholas M. and Chen, Sitan and Chewi, Sinho},
+  year = 2025,
+  month = nov,
+  number = {arXiv:2511.04844},
+  eprint = {2511.04844},
+  primaryclass = {cs},
+  publisher = {arXiv},
+  doi = {10.48550/arXiv.2511.04844},
+  archiveprefix = {arXiv}
+}
+```
